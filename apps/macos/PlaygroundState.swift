@@ -126,9 +126,11 @@ struct PlaygroundDocument: Codable, Sendable {
             Self.applyModelDefaults(qwen, to: &settings)
             settings = Self.newTemplateSettings(settings)
         }
+        let editingNotice = settings.normalizeQwen21EditingConfiguration()
         document = PlaygroundDocument(templates: Dictionary(uniqueKeysWithValues: PlaygroundTemplate.allCases.map {
             ($0.rawValue, PlaygroundTemplateDraft(settings: settings, instruction: $0.defaultInstruction))
         }))
+        message = editingNotice
         readSavedDocument()
     }
 
@@ -320,10 +322,15 @@ struct PlaygroundDocument: Codable, Sendable {
               model.output == "image", model.supports("image.edit") else {
             message = "请在创作页选择 Qwen Image 2.1 后同步模型与参数。"; return false
         }
+        var settings = Self.parameterSettings(draft)
+        settings.assets = orderedAssets
+        let editingNotice = settings.normalizeQwen21EditingConfiguration()
+        settings = Self.parameterSettings(settings)
         var updated = document
-        updated.templates[template.rawValue]?.settings = Self.parameterSettings(draft)
+        updated.templates[template.rawValue]?.settings = settings
         commit(updated)
-        message = "已同步模型与生成参数，按图片编辑执行。模板图片与附加指令已保留。"
+        message = ["已同步模型与生成参数，按图片编辑执行。模板图片与附加指令已保留。", editingNotice]
+            .compactMap { $0 }.joined(separator: " ")
         return true
     }
     func remove(_ role: PlaygroundRole) {
@@ -501,8 +508,20 @@ struct PlaygroundDocument: Codable, Sendable {
                 }
                 decoded.schemaVersion = 2
             }
-            document = decoded; revision = UUID(); loadBlocked = false; storageError = nil; saved = !migrated
-            message = nil
+            var editingNotices: [String] = []
+            for template in PlaygroundTemplate.allCases {
+                guard let entry = decoded.templates[template.rawValue] else { continue }
+                var settings = entry.settings
+                let savedAssets = settings.assets
+                settings.assets = template.roles.compactMap { entry.roleAssets[$0.rawValue] }
+                if let notice = settings.normalizeQwen21EditingConfiguration(),
+                   !editingNotices.contains(notice) { editingNotices.append(notice) }
+                settings.assets = savedAssets
+                decoded.templates[template.rawValue]?.settings = settings
+            }
+            document = decoded; revision = UUID(); loadBlocked = false; storageError = nil
+            saved = !migrated && editingNotices.isEmpty
+            message = editingNotices.isEmpty ? nil : editingNotices.joined(separator: " ")
         } catch {
             loadBlocked = true; saved = false
             storageError = "无法恢复 Playground：\(error.localizedDescription)。保存已暂停，原文件不会被覆盖；修复文件后可重新读取。"

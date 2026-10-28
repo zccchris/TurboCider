@@ -23,6 +23,12 @@ def clean_acceleration_environment():
 class CLIAneOverrideTests(unittest.TestCase):
     def test_qwen_runtime_staged_diagnostic_preserves_admission_and_memory_budget(self):
         flag = "TURBOCIDER_QWEN21_RUNTIME_STAGED_DIAGNOSTIC"
+        system_result = subprocess.run([str(CLI), "doctor"], cwd=ROOT,
+                                       env=clean_acceleration_environment(),
+                                       capture_output=True, text=True, timeout=10)
+        self.assertEqual(system_result.returncode, 0, system_result.stderr)
+        system = json.loads(system_result.stdout)
+        staged_edit_device = system["optimization_profile"]["qwen21_layer_streaming"]
         with tempfile.TemporaryDirectory(prefix="tc-runtime-staged-plan-") as temporary:
             root = Path(temporary)
             manifest = root / "metadata-only-manifest.json"
@@ -81,10 +87,21 @@ class CLIAneOverrideTests(unittest.TestCase):
                         self.assertIn("runtime_weight_fp16_token_row_ffn", staged["algorithm_approximations"])
                         self.assertEqual(resident["memory_estimate_bytes"] - staged["memory_estimate_bytes"],
                                          18 << 30)
-                        # Compare otherwise identical accepted plans instead of
-                        # copying the implementation's geometry/prefix formula.
-                        self.assertEqual(staged["memory_estimate_bytes"] - gpu["memory_estimate_bytes"],
-                                         2 << 30)
+                        # The runtime diagnostic retains its original absolute
+                        # budget. GPU base edits now stream layers separately,
+                        # so a fixed runtime-minus-GPU delta is no longer valid.
+                        canvas_bytes = 512 * 512 * 10240
+                        reference_bytes = count * ((2 << 30) + (512 << 20))
+                        self.assertEqual(staged["memory_estimate_bytes"],
+                                         (24 << 30) + canvas_bytes + reference_bytes)
+                        if staged_edit_device and count and not lora:
+                            self.assertEqual(gpu["memory_estimate_bytes"],
+                                             max(16 << 30, (10 << 30) + canvas_bytes + reference_bytes))
+                            self.assertLessEqual(gpu["memory_estimate_bytes"] + (4 << 30),
+                                                 system["physical_memory_bytes"])
+                        else:
+                            self.assertEqual(gpu["memory_estimate_bytes"],
+                                             (22 << 30) + canvas_bytes + reference_bytes)
                         self.assertEqual(staged["memory_estimate_kind"],
                                          "conservative_heuristic_not_hard_limit")
 

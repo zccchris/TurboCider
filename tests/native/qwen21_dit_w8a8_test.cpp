@@ -42,16 +42,24 @@ int main() {
     auto compiled = mx::compile([](const std::vector<Tensor> &args) {
         return std::vector<Tensor>{cider_project(args[0], args, 1)};
     });
-    for (int m : {1, 37, 129}) {
+    // Edit prefill adds reference rows, while decode remains 1024 rows.
+    // Small K/N isolates dynamic-row padding without full-model GPU work.
+    for (int m : {1, 37, 129, 1024, 2049, 4097, 8193}) {
         auto x = mx::astype(mx::reshape(mx::cos(mx::arange(m * 65, mx::float32) * Tensor(.103f)), {m,65}), mx::float16);
         auto y = cider_project(x, bank, 0);
         auto traced = compiled({x,bank[0],bank[1],bank[2]})[0];
         mx::eval(y,traced);
         assert(mx::array_equal(y,traced).item<bool>());
+        auto leading = cider_project(mx::reshape(x, {1,m,65}), bank, 0);
+        assert(leading.shape() == mx::Shape({1,m,77}));
+        assert(mx::array_equal(mx::reshape(leading, {m,77}), y).item<bool>());
         // Independent dequantized INT8 reference; M=1 must also quantize A.
         auto xf = mx::astype(x, mx::float32);
         auto sa = mx::max(mx::abs(xf), 1, true) / Tensor(127.f);
-        auto aq = mx::clip(mx::round(xf / sa), Tensor(-128.f), Tensor(127.f));
+        // Metal round uses half-away-from-zero and multiplies reciprocal scale.
+        auto scaled = xf * (Tensor(1.f) / sa);
+        auto aq = mx::clip(mx::sign(scaled) * mx::floor(mx::abs(scaled) + Tensor(.5f)),
+                           Tensor(-128.f), Tensor(127.f));
         auto qw = mx::slice(mx::astype(bank[0], mx::float32), {0,0}, {77,65});
         auto sw = mx::slice(bank[1], {0}, {77});
         auto reference = mx::astype(mx::matmul(aq, mx::transpose(qw)) * sa * sw, mx::float16);
@@ -144,5 +152,45 @@ int main() {
     }
     rejects([&] { combined.pack(mx::zeros({77,64},mx::float32), "unknown/projection"); });
     assert(combined.receipt().created == 3 && combined.receipt().hits == 3);
-    std::cout << "PASS Qwen21 DiT W8A8: SQ+ConvRot,  true A8, padding, compiled/eager, cache identity, corruption, cancellation\n";
+    CiderCache editing(root, calibrated_sha, {}, true, SqCalibration::Editing);
+    assert(editing.receipt().directory != combined.receipt().directory);
+    assert(editing.receipt().calibration_sha256 != combined.receipt().calibration_sha256);
+    assert(editing.receipt().calibration_payload_sha256 != combined.receipt().calibration_payload_sha256);
+    rejects([&] { CiderCache invalid(root, calibrated_sha, {}, false, SqCalibration::Editing); });
+    for (const auto &[k,key] : cases) {
+        const int n = 77, g = k == 64 ? 64 : 256;
+        auto weight = mx::astype(mx::reshape(mx::sin(mx::arange(n*k,mx::float32)*Tensor(.137f)),{n,k}),mx::bfloat16);
+        auto packed = editing.pack(weight,key), again = editing.pack(weight,key);
+        for (int i=0;i<3;++i) assert(mx::array_equal(packed[i],again[i]).item<bool>());
+        auto inv = mx::astype(mx::slice(mx::reshape(packed[2],{-1}),{n},{n+k}),mx::float32);
+        auto wr = dense_h(mx::astype(weight,mx::float32)/inv,g);
+        auto qw = mx::slice(mx::astype(packed[0],mx::float32),{0,0},{n,k});
+        auto sw = mx::slice(packed[1],{0},{n});
+        assert(mx::max(mx::abs(qw*mx::reshape(sw,{n,1})-wr)/mx::reshape(sw,{n,1})).item<float>() < .51f);
+        const std::vector<int> rows = k == 64 ? std::vector<int>{1,37,129,1024,2049,4097}
+                                              : std::vector<int>{1,37,129};
+        for (int m : rows) {
+            auto x = mx::astype(mx::reshape(mx::cos(mx::arange(m*k,mx::float32)*Tensor(.103f)),{m,k}),mx::float16);
+            auto xf = mx::astype(dense_h(mx::astype(x,mx::float32)*inv,g),mx::float16);
+            auto fp = mx::astype(xf,mx::float32);
+            auto sa = mx::max(mx::abs(fp),1,true)/Tensor(127.f);
+            auto scaled = fp*(Tensor(1.f)/sa);
+            auto aq = mx::clip(mx::sign(scaled)*mx::floor(mx::abs(scaled)+Tensor(.5f)),Tensor(-128.f),Tensor(127.f));
+            auto reference = mx::astype(mx::matmul(aq,mx::transpose(qw))*sa*sw,mx::float16);
+            auto y = cider_project(x,packed,0), traced = compiled({x,packed[0],packed[1],packed[2]})[0];
+            mx::eval(y,traced);
+            assert(mx::array_equal(y,traced).item<bool>());
+            assert(mx::max(mx::abs(mx::astype(y,mx::float32)-mx::astype(reference,mx::float32))).item<float>() < .08f);
+        }
+        // Wrong-profile data cannot be mistaken for an editing cache, even
+        // when model, projection and dimensions match.
+        auto filename = std::filesystem::path(editing.receipt().directory)/key/"packed.safetensors";
+        auto [saved, meta] = mx::load_safetensors(filename.string());
+        for (auto &[_, array] : saved) mx::eval(array);
+        meta["adapter_recipe"] = combined.receipt().recipe;
+        mx::save_safetensors(filename.string(),saved,meta);
+        rejects([&] { editing.pack(weight,key); });
+    }
+    assert(editing.receipt().created == 3 && editing.receipt().hits == 3);
+    std::cout << "PASS Qwen21 DiT W8A8: SQ+ConvRot,  true A8, long edit-prefill/1024-decode rows, 3D shape, padding, compiled/eager, cache identity, corruption, cancellation\n";
 }

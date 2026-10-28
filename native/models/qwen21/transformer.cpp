@@ -104,8 +104,14 @@ void Transformer::configure_staged_optimizations(int attention_bits, bool qk_nor
     cider_dit_small_cache_.clear();
     require(attention_bits == 0 || attention_bits == 4 || attention_bits == 8,
             "Qwen21 staged attention bits must be 0, 4 or 8");
-    require((!attention_bits && !qk_norm_rope) || config_ == TransformerConfig{},
-            "Qwen21 staged optimizations require the standard transformer geometry");
+    // Attention packing needs 128-aligned square projections, independent of
+    // layer count and prefix length. Public request admission still selects
+    // only the standard model; smaller aligned fixtures exercise real prefix
+    // and bank lifetimes. The fused Q/K kernel retains its fixed geometry.
+    require(!attention_bits || config_.hidden() % 128 == 0,
+            "Qwen21 staged attention requires 128-aligned hidden dimensions");
+    require(!qk_norm_rope || config_ == TransformerConfig{},
+            "Qwen21 Q/K fusion requires the standard transformer geometry");
     require(!qk_norm_rope || (!metal_qk_rope_ && !fused_qkv_),
             "Qwen21 Q/K norm-RoPE fusion cannot combine with another fused QKV/RoPE kernel");
     const bool cider = bool(cider_cache);

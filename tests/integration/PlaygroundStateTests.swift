@@ -75,6 +75,7 @@ import UniformTypeIdentifiers
         try await expandedWorkflows(root: root, model: model, initial: initial, person: person, target: scene)
         try await editableConfiguration(root: root, model: model, initial: initial, person: person, clothing: clothing)
         try await modelDefaults(root: root, model: model, initial: initial, person: person)
+        try await editingAccelerationMigration(root: root, model: model, initial: initial, person: person, clothing: clothing)
         print("PASS five-workflow composition, face roles, outpaint bounds, transparent generate/edit, schema-1 migration; Playground independent drafts/roles/import rollback/persistence/provenance, source-based resize/restore, parameter blocks and provider pending/cancel/context guards (CPU only)")
     }
 
@@ -465,6 +466,86 @@ import UniformTypeIdentifiers
         blocked.save()
         try check(blocked.storageError != nil && (try Data(contentsOf: legacyFile)) == invalidBytes,
                   "Invalid stored expansion was accepted or overwritten")
+    }
+
+    @MainActor private static func editingAccelerationMigration(root: URL, model: StudioModel, initial: StudioDraft,
+        person: URL, clothing: URL) async throws {
+        var optimized = initial
+        optimized.loras = []; optimized.residency = "component_staged"
+        let editManifest = root.appendingPathComponent("qwen-edit-w8a8.json")
+        try JSONSerialization.data(withJSONObject: ["schema_version": 2,
+            "export_identity": ["owner": "turbocider.qwen21.dit.coreml.v1", "tensor_layout": "qwen21",
+                "variant": "int8_pc", "activation_precision": "int8"]]).write(to: editManifest)
+        optimized.acceleration = StudioAcceleration(policy: "gpu_ane", manifest: editManifest.path, qwen21W8A8: false)
+        optimized.qwen21DiTW8A8 = true; optimized.qwen21DiTSmoothQuantConvRot = true
+        optimized.qwen21DiTCache = "fast"; optimized.promptEnhance = true
+        optimized.promptEnhancerPath = "/test/pe-t2i"
+        let before = try bytes(optimized)
+        let directory = root.appendingPathComponent("playground-editing-migration")
+        let state = PlaygroundState(directory: directory, initialSettings: optimized, models: [model])
+        try check(state.message?.contains("图片编辑已关闭") == true,
+                  "New Playground omitted its editing-configuration migration notice")
+        for entry in state.document.templates.values {
+            try check(entry.settings.acceleration?.policy == "gpu" && entry.settings.acceleration?.qwen21W8A8 == false &&
+                      !entry.settings.qwen21DiTW8A8 && !entry.settings.qwen21DiTSmoothQuantConvRot && !entry.settings.promptEnhance &&
+                      entry.settings.qwen21DiTCache == "fast" && entry.settings.steps == optimized.steps &&
+                      entry.settings.promptEnhancerPath == optimized.promptEnhancerPath,
+                      "New Playground inherited generation-only flags or lost supported settings")
+        }
+        let imported = await state.importFiles([person, clothing])
+        state.setInstruction("Keep this instruction and both reference roles")
+        let references = state.orderedAssets
+        try check(imported && state.syncSettings(from: optimized) && state.message?.contains("图片编辑已关闭") == true,
+                  "Playground synchronization did not explain generation-only flags")
+        let draft = try state.generationDraft()
+        let request = try draft.request(output: root.appendingPathComponent("unused-playground-edit.png"), systemJSON: "{}")
+        try check(request.operation == "image.edit" && request.execution == "gpu" && request.qwen21_dit_cache == "fast" &&
+                  request.prompt_enhancer_path == nil && draft.assets == references &&
+                  state.instruction == "Keep this instruction and both reference roles" && (try bytes(optimized)) == before,
+                  "Playground migration changed content, source settings or supported request flags")
+        // Simulate an older saved document whose template settings copied the
+        // incompatible Creation options. Restore repairs memory, preserving the
+        // existing read-before-write contract until an explicit/normal save.
+        var legacy = state.document
+        for key in legacy.templates.keys {
+            var settings = optimized
+            settings.operation = "image.edit"; settings.assets = []; settings.prompt = ""
+            legacy.templates[key]?.settings = settings
+        }
+        let file = directory.appendingPathComponent("playground.json"), legacyBytes = try bytes(legacy)
+        try legacyBytes.write(to: file)
+        let restored = PlaygroundState(directory: directory, initialSettings: initial, models: [model])
+        try check(restored.storageError == nil && !restored.saved && restored.message?.contains("图片编辑已关闭") == true &&
+                  restored.settings.acceleration?.policy == "gpu" && !restored.settings.qwen21DiTW8A8 &&
+                  restored.settings.qwen21DiTCache == "fast" && restored.orderedAssets == references &&
+                  (try Data(contentsOf: file)) == legacyBytes,
+                  "Playground restore left incompatible options or rewrote saved input evidence")
+        _ = try restored.generationDraft()
+        restored.save()
+        let reopened = PlaygroundState(directory: directory, initialSettings: initial, models: [model])
+        try check(reopened.saved && reopened.storageError == nil && reopened.settings.acceleration?.policy == "gpu" &&
+                  !reopened.settings.qwen21DiTSmoothQuantConvRot && reopened.orderedAssets == references,
+                  "Playground migration was not persisted on save")
+        if Qwen21LowMemoryANEHardware.isEligible() {
+            var hybrid = optimized
+            hybrid.qwen21ReferenceSize = 512; hybrid.promptEnhance = false
+            hybrid.qwen21DiTSmoothQuantConvRot = true
+            try check(state.syncSettings(from: hybrid), "Playground rejected qualified ANE settings synchronization")
+            let hybridDraft = try state.generationDraft()
+            try check(hybridDraft.qualifiedQwen21StagedANEEdit() && hybridDraft.qwen21DiTW8A8 && hybridDraft.qwen21DiTSmoothQuantConvRot &&
+                      hybridDraft.assets == references && state.settings.assets.isEmpty,
+                      "Playground discarded supported ANE because parameter-only settings contain no images")
+            state.save()
+            let hybridRestored = PlaygroundState(directory: directory, initialSettings: initial, models: [model])
+            try check((try hybridRestored.generationDraft()).qualifiedQwen21StagedANEEdit() &&
+                      hybridRestored.settings.qwen21DiTW8A8 && hybridRestored.settings.qwen21DiTSmoothQuantConvRot && hybridRestored.orderedAssets == references,
+                      "Playground restore did not use the saved role references for ANE eligibility")
+        }
+        // Explicit edits still remain visible and fail validation; only copied
+        // or restored editing presets are migrated automatically.
+        restored.updateSettings { $0.qwen21DiTW8A8 = true }
+        try check(restored.settings.qwen21DiTW8A8 && restored.generationBlocker?.contains("DiT W8A8") == true,
+                  "Playground silently rewrote explicitly edited settings")
     }
 
     @MainActor private static func editableConfiguration(root: URL, model: StudioModel, initial: StudioDraft,

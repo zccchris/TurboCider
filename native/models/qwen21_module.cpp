@@ -27,6 +27,7 @@ ModelModule qwen21_module() {
             const auto db_options = qwen21::db_cache_options(r);
             const auto device = device_info();
             const bool staged_optimizations = qwen21::qualified_staged_optimizations(r, device);
+            const bool staged_hybrid_edit = qwen21::layer_staged_hybrid_edit(r, device);
             (void)qwen21::staged_optimization_options(r, device);
             (void)qwen21::configured_student_graph_request(r);
             (void)qwen21::configured_fp16_vae_decode_request(r);
@@ -319,7 +320,7 @@ ModelModule qwen21_module() {
                         "Qwen21 DBCache is diagnostic-only for 20...40-step 512px or validated 768x512/512x768 base GPU or GPU/ANE with 0...3 references and no step-FFN reuse");
             if (db_options.enabled && !db_options.diagnostic) {
                 const bool frozen_cache = qwen21::frozen_conservative_cache_request(r);
-                require(staged_optimizations || (r.allow_approximation && (r.execution == "gpu" || frozen_cache || runtime_cache) &&
+                require(staged_optimizations || staged_hybrid_edit || (r.allow_approximation && (r.execution == "gpu" || frozen_cache || runtime_cache) &&
                             (r.hybrid_mlp_mode == "auto" || runtime_cache) && r.width == 512 && r.height == 512 &&
                             r.steps >= 20 && r.steps <= 40 && !r.prompt_enhance &&
                             (r.qwen21_reference_size == 1024 ||
@@ -348,7 +349,7 @@ ModelModule qwen21_module() {
                         "TURBOCIDER_QWEN21_VIGGLE_LORA_FP16"}) {
                     const char *value = std::getenv(name);
                     require(!value || std::string_view(value) == "0" ||
-                                (staged_optimizations && std::string_view(name) ==
+                                ((staged_optimizations || staged_hybrid_edit) && std::string_view(name) ==
                                     "TURBOCIDER_QWEN21_METAL_QK_NORM_ROPE" &&
                                  qwen21::option_enabled(value)),
                             std::string("Qwen21 DiT cache preset conflicts with experimental option ") + name);

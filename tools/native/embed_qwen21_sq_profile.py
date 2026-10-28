@@ -11,9 +11,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = ROOT / "native/models/qwen21/calibration"
 
-def generate(directory: Path, output: Path):
-    meta = json.loads((directory / "sq_convrot_v1.json").read_text())
-    data = (directory / "sq_convrot_v1.f16le").read_bytes()
+def generate(directory: Path, output: Path, *, stem="sq_convrot_v1", namespace="sq_profile"):
+    meta = json.loads((directory / (stem + ".json")).read_text())
+    data = (directory / (stem + ".f16le")).read_bytes()
     if meta["schema"] != "qwen21-sq-convrot-profile-v1" or hashlib.sha256(data).hexdigest() != meta["payload_sha256"]:
         raise ValueError("SmoothQuant calibration payload integrity mismatch")
     for name in ("identity", "source_sha256", "payload_sha256"):
@@ -33,7 +33,7 @@ def generate(directory: Path, output: Path):
         raise ValueError("Incomplete calibration profile")
     if any(not math.isfinite(x) or not 1/16 <= x <= 16 for x, in struct.iter_unpack("<e", data)):
         raise ValueError("Invalid inverse scale")
-    lines = ["#pragma once", "#include <cstdint>", "namespace tc::qwen21::sq_profile {",
+    lines = ["#pragma once", "#include <cstdint>", f"namespace tc::qwen21::{namespace} {{",
              "struct Entry { const char *key; int offset, channels; };"]
     for name in ("identity", "source_sha256", "payload_sha256"):
         lines.append(f'inline constexpr const char *{name} = "{meta[name]}";')
@@ -51,3 +51,5 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     generate(ASSETS, args.output)
+    generate(ASSETS, args.output.with_name("qwen21_sq_edit_profile_generated.hpp"),
+             stem="sq_convrot_edit_v1", namespace="sq_edit_profile")

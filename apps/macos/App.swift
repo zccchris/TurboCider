@@ -138,6 +138,7 @@ struct StudioView: View {
     @State private var annotationAsset: StudioAsset?
     @State private var preparationAsset: StudioAsset?
     @State private var showingCanvasSizing = false
+    @State private var showingAccelerationSettings = false
     private var selectedJob: NativeJob? { store.jobs.first { $0.id == selected && $0.hasOutput } }
     private var previewAsset: StudioAsset? {
         studio.draft.assets.first { $0.id == previewAssetID } ?? studio.draft.activeAssets.first
@@ -296,6 +297,7 @@ struct StudioView: View {
         .onChange(of: studio.draft.operation) { _, _ in focusInput() }
         .onChange(of: studio.workspaceResetID) { _, _ in
             focusInput(); annotationAsset = nil; preparationAsset = nil; showingCanvasSizing = false
+            showingAccelerationSettings = false
             showingRecentResults = false; ignoredStatusID = store.jobs.first?.id
             if let source = pendingUpscaleReuseSource {
                 imageUpscaling = true; upscaleSourcePath = source; pendingUpscaleReuseSource = nil; page = .upscale
@@ -339,6 +341,7 @@ struct StudioView: View {
     }
     var body: some View {
         workspaceState
+        .sheet(isPresented: $showingAccelerationSettings) { advancedAccelerationSettings.tint(ciderAccent) }
         .sheet(item: $annotationAsset) { asset in Qwen21AnnotationEditor(asset: asset, studio: studio).tint(ciderAccent) }
         .sheet(item: $preparationAsset) { asset in ReferenceImagePreparationView(asset: asset, studio: studio).tint(ciderAccent) }
         .sheet(isPresented: $showingCanvasSizing) {
@@ -993,14 +996,19 @@ struct StudioView: View {
                 Text("计算设备").font(.caption)
                 Toggle("GPU", isOn: .constant(true)).toggleStyle(.checkbox).disabled(true)
                 let qwenLoRA = studio.draft.modelID == "qwen-image-2.1" && !studio.draft.activeLoRAs.isEmpty && !studio.draft.usesRuntimeANE
+                let qwenEditing = studio.draft.modelID == "qwen-image-2.1" && studio.draft.operation == "image.edit" && !studio.draft.usesRuntimeANE
+                let qwenEditingANEIssue = qwenEditing ? studio.draft.qwen21ANEEditingConfigurationIssue() : nil
                 Toggle("额外启用 ANE", isOn: Binding(get: { studio.draft.usesANE && !qwenLoRA }, set: { studio.setANEEnabled($0) }))
-                    .toggleStyle(.checkbox).disabled(store.busy || submitting || model?.supports_gpu_ane != true || studio.draft.zImageVariant?.id == "nvfp4" || qwenLoRA).accessibilityIdentifier("enableANE")
-                Text(studio.draft.aneConfigurationNotice ?? (qwenLoRA ? "App 中 Qwen LoRA 使用纯 GPU，基础模型的 ANE 分区不包含适配器。" : (studio.draft.usesANE ? "生成前检查匹配分区。ANE 不保证更快；首次加载较慢，长文本可优先使用 GPU。" : "默认只使用 GPU。"))).font(.caption2).foregroundStyle(.secondary)
+                    .toggleStyle(.checkbox).disabled(store.busy || submitting || model?.supports_gpu_ane != true || studio.draft.zImageVariant?.id == "nvfp4" || qwenLoRA || (qwenEditingANEIssue != nil && !studio.draft.usesANE)).accessibilityIdentifier("enableANE")
+                Text(studio.draft.aneConfigurationNotice ?? (qwenEditing ? (qwenEditingANEIssue ?? "快速 512 编辑可选固定 W8A8 ANE，并复用 DiT 缓存与 DiT W8A8；图像细节可能变化。") : (qwenLoRA ? "App 中 Qwen LoRA 使用纯 GPU，基础模型的 ANE 分区不包含适配器。" : (studio.draft.usesANE ? "生成前检查匹配分区。ANE 不保证更快；首次加载较慢，长文本可优先使用 GPU。" : "默认只使用 GPU。")))).font(.caption2).foregroundStyle(.secondary)
                 if studio.draft.modelID == "qwen-image-2.1", (studio.draft.acceleration?.policy ?? "gpu") != "gpu" || !studio.draft.profilePath.isEmpty {
                     Button("改用纯 GPU") { studio.draft.profilePath = ""; studio.setANEEnabled(false) }
                         .disabled(store.busy || submitting).accessibilityIdentifier("qwenLoRAUseGPU")
                 }
-                if ["z-image-turbo", "qwen-image-2.1"].contains(studio.draft.modelID) { Button("高级加速与缓存配置") { librarySelection = studio.draft.modelID; page = .models } }
+                if ["z-image-turbo", "qwen-image-2.1"].contains(studio.draft.modelID) {
+                    Button("高级加速与缓存配置") { showingAccelerationSettings = true }
+                        .accessibilityIdentifier("openAccelerationSettings")
+                }
                 if studio.draft.usesANE, let status = store.accelerationStatus { Text(status).font(.caption2).foregroundStyle(.secondary) }
             }
             if model?.supports_lora == true {
@@ -1225,6 +1233,33 @@ struct StudioView: View {
             Spacer(minLength: 8)
             Text("一次生成一个结果\n图片、提示词与参数均保存在本机。").font(.caption2).foregroundStyle(.secondary)
         }.disabled(assetControlsLocked)
+    }
+    private var advancedAccelerationSettings: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("高级加速与缓存配置").font(.title2.weight(.semibold))
+                Spacer()
+                Button("完成") { showingAccelerationSettings = false }
+                    .keyboardShortcut(.cancelAction).accessibilityIdentifier("closeAccelerationSettings")
+            }
+            Text(model?.name ?? studio.draft.modelID).font(.subheadline).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if studio.draft.modelID == "qwen-image-2.1", studio.draft.operation == "image.edit" {
+                        Qwen21ReferenceEncodingSettings(draft: studio.draft,
+                            locked: store.busy || submitting || studio.imageInputsBusy || api.running || api.changing,
+                            setSize: { studio.setQwen21ReferenceSize($0) })
+                    }
+                    AccelerationView(store: store, studio: studio, library: library)
+                    if studio.draft.modelID == "qwen-image-2.1" { qwen21DiTCacheSettings }
+                    if let message = studio.message {
+                        Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(store.busy || submitting || studio.imageInputsBusy || api.running || api.changing)
+            }
+        }.padding(24).frame(width: 720, height: 660)
+            .accessibilityIdentifier("advancedAccelerationSettings")
     }
     private var qwen21DiTCacheSettings: some View {
         VStack(alignment: .leading, spacing: 8) {

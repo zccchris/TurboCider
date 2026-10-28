@@ -6,8 +6,8 @@
 
 namespace tc::qwen21 {
 // Qualified small-canvas BF16 route: consume the language encoder one layer
-// at a time, then stream DiT layers on every step, then load the VAE. Larger canvases,
-// multimodal conditioning and PE retain their existing estimate.
+// at a time, then stream DiT layers on every step, then load the VAE. Larger
+// canvases and PE retain their existing estimate.
 inline bool layer_staged_hybrid_request(const Request &r, const DeviceInfo &device) {
     // Native currently owns all dense DiT weights during the complete graph.
     // It must never inherit the smaller per-layer MLX residency estimate.
@@ -93,6 +93,26 @@ inline bool qualified_staged_optimizations(const Request &r, const DeviceInfo &d
     return !cache.enabled || (cache.front_blocks == 8 && cache.warmup_steps == 8);
 }
 
+// Editing keeps the same 1024 target rows on every decode step: reference
+// image tokens only enlarge the GPU prefill/prefix KV. Reuse the qualified
+// frozen 6144-channel ANE lifecycle without inheriting generation's implicit
+// W4 attention/suffix defaults. The actual manifest geometry is checked before
+// constructing HybridMLP. Full DiT W8A8 uses dynamic per-token activation
+// scales, so it also supports the longer prefill. SQ+ConvRot selects an
+// independent frozen editing profile; generation calibration stays unchanged.
+inline bool layer_staged_hybrid_edit(const Request &r, const DeviceInfo &device) {
+    if (r.operation != "image.edit" || r.inputs.empty() || r.inputs.size() > 3 ||
+        r.qwen21_reference_size != 512 || r.frames != 1 || r.audio ||
+        db_cache_options(r).diagnostic) return false;
+    // Use exactly the same hardware, runtime, experiment and cache admission
+    // checks as qualified generation. A disabled PE installation path is inert.
+    Request generation = r;
+    generation.operation = "image.generate";
+    generation.inputs.clear();
+    generation.prompt_enhancer_path.clear();
+    return qualified_staged_optimizations(generation, device);
+}
+
 struct StagedOptimizationOptions {
     int suffix_bits = 0;
     int attention_bits = 0;
@@ -114,11 +134,14 @@ inline StagedOptimizationOptions staged_optimization_options(const Request &r, c
     const char *defaults = std::getenv("TURBOCIDER_QWEN21_STAGED_FAST_DEFAULTS");
     require(binary_option_or_unset(defaults), "Qwen staged fast defaults require 0 or 1");
     const bool qualified = qualified_staged_optimizations(r, device);
+    const bool qualified_edit = layer_staged_hybrid_edit(r, device);
+    require(!r.qwen21_dit_smoothquant_convrot || qualified || qualified_edit,
+            "SmoothQuant+ConvRot requires qualified generation or 1...3 resized-512 edit references");
     require(!r.qwen21_dit_smoothquant_convrot || r.qwen21_dit_w8a8,
             "SmoothQuant+ConvRot requires DiT W8A8 with its staged ANE eligibility conditions");
     if (r.qwen21_dit_w8a8) {
-        require(qualified && r.frames == 1 && !r.audio,
-                "DiT W8A8 requires M5 Pro 24 GiB, no LoRA, 512x512/20-40 steps, layer-streamed component_staged, GPU+ANE W8A8 and original MLX text/VAE precision");
+        require((qualified || qualified_edit) && r.frames == 1 && !r.audio,
+                "DiT W8A8 requires M5 Pro 24 GiB, no LoRA, 512x512/20-40 steps, layer-streamed component_staged, GPU+ANE W8A8, generation or 1...3 resized-512 edit references, and original MLX text/VAE precision");
         require(!defaults || option_enabled(defaults),
                 "DiT W8A8 cannot combine with disabled staged defaults");
         for (const char *name : {"TURBOCIDER_QWEN21_STAGED_SUFFIX_BITS", "TURBOCIDER_QWEN21_STAGED_ATTN_BITS"}) {
@@ -145,13 +168,90 @@ inline StagedOptimizationOptions staged_optimization_options(const Request &r, c
     return {bits("TURBOCIDER_QWEN21_STAGED_SUFFIX_BITS"),
             bits("TURBOCIDER_QWEN21_STAGED_ATTN_BITS"),
             // Explicit legacy QK selection remains valid outside this profile.
-            option_or_default(std::getenv("TURBOCIDER_QWEN21_METAL_QK_NORM_ROPE"), use_defaults)};
+            option_or_default(std::getenv("TURBOCIDER_QWEN21_METAL_QK_NORM_ROPE"),
+                use_defaults || (qualified_edit && (!defaults || option_enabled(defaults))))};
 }
 
 inline bool layer_staged_hybrid_t2i(const Request &r, const DeviceInfo &device) {
     if (!layer_staged_hybrid_request(r, device)) return false;
     return !db_cache_options(r).enabled || qualified_staged_optimizations(r, device);
 }
+// Reuse the exact GPU streaming lifecycle for bounded base-model edits.
+// Approximation permission alone does not change math; resized references and
+// DiT-cache presets retain their existing explicit request validation. Keep
+// ANE/quantized generation recipes and retained encoder experiments separate.
+inline bool layer_staged_edit(const Request &r, const DeviceInfo &device) {
+    if (!device.optimizations().qwen21_layer_streaming ||
+        r.qwen21_denoiser_backend != "mlx" || r.model != "qwen-image-2.1" ||
+        r.residency != "component_staged" || r.operation != "image.edit" ||
+        (r.execution != "gpu" && r.execution != "auto") ||
+        r.inputs.empty() || r.inputs.size() > 3 ||
+        r.width > 512 || r.height > 512 || !r.loras.empty() ||
+        (r.qwen21_reference_size != 1024 && r.qwen21_reference_size != 512) ||
+        r.hybrid_mlp_mode != "auto" || !r.ane_manifest.empty() ||
+        !r.encoder_ane_manifest.empty() || r.prompt_enhance ||
+        r.prompt_enhance_edit_experimental ||
+        r.qwen21_w8a8 || r.qwen21_gpu_w8a16 || r.qwen21_dit_w8a8 ||
+        r.qwen21_dit_smoothquant_convrot || !r.qwen21_gpu_full_ffn_blocks.empty() ||
+        r.streaming.active() || r.streaming_offload || r.memory_constrained.enabled ||
+        r.quantized_execution.active()) return false;
+    for (const char *flag : {"TURBOCIDER_QWEN21_METAL_FUSED_QKV_DIAGNOSTIC",
+            "TURBOCIDER_QWEN21_GPU_REUSE_FINAL_FFN",
+            "TURBOCIDER_QWEN21_GPU_REUSE_PENULTIMATE_EVEN_FFN",
+            "TURBOCIDER_QWEN21_HYBRID_REUSE_FINAL_FFN_DIAGNOSTIC",
+            "TURBOCIDER_QWEN21_HYBRID_REUSE_FINAL_LAST16_FFN_DIAGNOSTIC",
+            "TURBOCIDER_QWEN21_HYBRID_REUSE_PENULTIMATE_EVEN_FFN_DIAGNOSTIC",
+            "TURBOCIDER_QWEN21_ENCODER_RETAIN_WEIGHTS",
+            "TURBOCIDER_QWEN21_ENCODER_RETAIN_RUNTIME",
+            "TURBOCIDER_QWEN21_ENCODER_COMPILED_GPU",
+            "TURBOCIDER_QWEN21_ENCODER_PREFILL_GPU",
+            "TURBOCIDER_QWEN21_BF16_STREAMING"})
+        if (option_enabled(std::getenv(flag))) return false;
+    const char *encoder = std::getenv("TURBOCIDER_QWEN21_ENCODER_BACKEND");
+    if (encoder && std::string_view(encoder) != "mlx") return false;
+    for (const char *path : {"TURBOCIDER_QWEN21_ENCODER_RUNTIME_MANIFEST",
+            "TURBOCIDER_QWEN21_ENCODER_CALIBRATION_OUT",
+            "TURBOCIDER_QWEN21_NATIVE_ENCODER_ANE_CACHE",
+            "TURBOCIDER_QWEN21_NATIVE_PREFILL_ANE_CACHE"}) {
+        const char *value = std::getenv(path);
+        if (value && *value) return false;
+    }
+    // Public cache presets already cover this edit geometry. Other diagnostic
+    // cache schedules keep their previous conservative estimate.
+    const auto cache = db_cache_options(r);
+    return !cache.enabled || !cache.diagnostic;
+}
+
+inline uint64_t staged_edit_memory_estimate(const Request &r, uint64_t reference_tokens) {
+    // Vision, streamed language, reference VAE, streamed DiT and output VAE
+    // execute separately. 16 GiB covers the encoder/decoder working phase;
+    // denoising reserves 10 GiB for one dense layer, text prefix, activations
+    // and allocator headroom, plus the actual image prefix and canvas work.
+    // Cross-request prefix snapshots are disabled for this route. Lightweight
+    // conditioning caches are bounded to 128 MiB by the pipeline. This remains
+    // a conservative heuristic, with the normal 4 GiB system margin added by
+    // admission. Runtime rechecks rounded reference area before loading weights.
+    constexpr uint64_t kv_bytes_per_token = 2ull * 32 * 4096 * 2;
+    const uint64_t denoise = (10ull << 30) +
+        uint64_t(r.width) * r.height * 10240 + reference_tokens * kv_bytes_per_token +
+        uint64_t(r.inputs.size()) * (512ull << 20);
+    return denoise > (16ull << 30) ? denoise : (16ull << 30);
+}
+
+inline uint64_t staged_hybrid_edit_memory_estimate(const Request &r, uint64_t reference_tokens) {
+    // Reuse the GPU edit phase reserves. Frozen Core ML owns an additional
+    // 1 GiB runtime allowance. On decode, compact BF16 FFN suffix banks add
+    // 4.5 GiB (32 * 3 * 6144 * 4096 * 2 bytes). They are built after prefill,
+    // so reference prefill scratch and these suffix banks are not simultaneous.
+    // W8A8 DiT/suffix use less space; retain the BF16 bound for both options.
+    // The real rounded reference area is rechecked before encoding, and the
+    // normal 4 GiB system margin remains external to this phase estimate.
+    constexpr uint64_t kv_bytes_per_token = 2ull * 32 * 4096 * 2;
+    const uint64_t decode = (10ull << 30) + (1ull << 30) + (4608ull << 20) +
+        uint64_t(r.width) * r.height * 10240 + reference_tokens * kv_bytes_per_token;
+    return std::max(staged_edit_memory_estimate(r, reference_tokens) + (1ull << 30), decode);
+}
+
 inline bool layer_staged_t2i(const Request &r, const DeviceInfo &device) {
     if (r.qwen21_denoiser_backend != "mlx") return false;
     if (!device.optimizations().qwen21_layer_streaming) return false;

@@ -394,8 +394,12 @@ struct StudioDraft: Codable, Sendable {
     }
     var qwen21FastReferenceUnavailableReason: String? {
         guard modelID == "qwen-image-2.1", operation == "image.edit" else { return "快速 512 仅用于 Qwen 图片编辑。" }
+        if usesANE && !usesRuntimeANE {
+            if (try? AccelerationDiscovery.qwen21ManifestUsesW8A8(acceleration?.manifest ?? "")) != true { return "快速 512 的 ANE 编辑需要选择固定 W8A8 分区；普通 FP16 分区请改用 GPU。" }
+            return qwen21ANEEditingConfigurationIssue(requireReferenceSize: false)
+        }
         if (acceleration?.policy ?? (profilePath.isEmpty ? "gpu" : "profile")) != "gpu" || !profilePath.isEmpty {
-            return "快速 512 仅支持明确的纯 GPU 设置，不与 ANE 或设备配置联动。"
+            return "快速 512 支持纯 GPU 或本机固定 W8A8 ANE，不支持 Runtime 或设备配置。"
         }
         if width != 512 || height != 512 { return "快速 512 当前需要 512×512 输出画布。" }
         if !(1...3).contains(activeAssets.count) { return "快速 512 当前支持 1–3 张参考图；请核对编辑输入。" }
@@ -428,7 +432,72 @@ struct StudioDraft: Codable, Sendable {
         guard [1024, 512].contains(qwen21ReferenceSize) else { return "模型参考编码设置无效，请恢复标准 1024。" }
         return qwen21ReferenceSize == 512 ? qwen21FastReferenceUnavailableReason : nil
     }
+    /// Shape/settings eligibility is shared by the ANE toggle, reference
+    /// selector and submission validation. The native loader additionally
+    /// verifies checkpoint identity and the fixed partition's exact geometry.
+    func qwen21ANEEditingConfigurationIssue(systemJSON: String? = nil,
+                                            requireReferenceSize: Bool = true) -> String? {
+        guard modelID == "qwen-image-2.1", operation == "image.edit" else { return "固定 W8A8 ANE 编辑仅用于 Qwen 图片编辑。" }
+        guard Qwen21LowMemoryANEHardware.isEligible(systemJSON: systemJSON ?? NativeEngine.system()) else {
+            return "固定 W8A8 ANE 编辑仅适用于 Apple M5 Pro、24 GiB 内存；当前设备请使用 GPU。"
+        }
+        if requireReferenceSize && qwen21ReferenceSize != 512 {
+            return "标准 1024 参考编码请使用 GPU；如需固定 W8A8 ANE，请自行选择快速 512（近似预览）。"
+        }
+        if width != 512 || height != 512 || frames != 1 || audio { return "固定 W8A8 ANE 编辑需要 512×512 单张图片输出。" }
+        if !(20...40).contains(steps) { return "固定 W8A8 ANE 编辑需要 20–40 步。" }
+        if !(1...3).contains(activeAssets.count) { return "固定 W8A8 ANE 编辑需要 1–3 张参考图。" }
+        if residency != "component_staged" { return "固定 W8A8 ANE 编辑需要分阶段加载。" }
+        if !activeLoRAs.isEmpty || promptEnhance { return "固定 W8A8 ANE 编辑暂不支持 LoRA 或提示词增强；请关闭这些选项或使用 GPU。" }
+        if usesPublicStreaming || !profilePath.isEmpty || acceleration?.compileGPU == true || acceleration?.runtimeAneProfileID != nil {
+            return "固定 W8A8 ANE 编辑不与流式档位、设备配置、GPU 编译或 Runtime 实验组合使用。"
+        }
+        return nil
+    }
+    func qualifiedQwen21StagedANEEdit(systemJSON: String? = nil) -> Bool {
+        usesANE && !usesRuntimeANE &&
+            (try? AccelerationDiscovery.qwen21ManifestUsesW8A8(acceleration?.manifest ?? "")) == true &&
+            acceleration?.manifest.isEmpty == false &&
+            qwen21ANEEditingConfigurationIssue(systemJSON: systemJSON) == nil
+    }
+    func qwen21ANEEditingRequestIssue(systemJSON: String? = nil) -> String? {
+        guard modelID == "qwen-image-2.1", operation == "image.edit", usesANE, !usesRuntimeANE else { return nil }
+        if let issue = qwen21ANEEditingConfigurationIssue(systemJSON: systemJSON) { return issue }
+        if (try? AccelerationDiscovery.qwen21ManifestUsesW8A8(acceleration?.manifest ?? "")) != true { return "图片编辑需选择固定 W8A8 量化分区，普通 FP16 ANE 分区仅支持文生图；也可改用 GPU。" }
+        if acceleration?.manifest.isEmpty != false { return "请在高级加速设置选择匹配的已编译 W8A8 分区，或改用 GPU。" }
+        return nil
+    }
+    /// Normalize inherited editing settings, never change the user's selected
+    /// reference size. Compatible W8A8, full DiT and cache selections survive.
+    @discardableResult
+    mutating func normalizeQwen21EditingConfiguration(systemJSON: String? = nil) -> String? {
+        guard modelID == "qwen-image-2.1", operation == "image.edit" else { return nil }
+        var disabled: [String] = []
+        if promptEnhance && !promptEnhanceEditExperimental {
+            promptEnhance = false; disabled.append("文生图提示词增强")
+        }
+        let supportedANE = qualifiedQwen21StagedANEEdit(systemJSON: systemJSON)
+        if usesANE && !usesRuntimeANE && !supportedANE {
+            acceleration?.policy = "gpu"
+            disabled.append("当前参数不支持的固定 ANE 分区")
+        }
+        if acceleration?.qwen21W8A8 == true && !supportedANE {
+            acceleration?.qwen21W8A8 = false
+            if disabled.isEmpty { disabled.append("当前参数不支持的固定量化分区") }
+        }
+        if qwen21DiTW8A8 && !supportedANE { qwen21DiTW8A8 = false; disabled.append("DiT W8A8") }
+        if qwen21DiTSmoothQuantConvRot && (!supportedANE || !qwen21DiTW8A8) {
+            qwen21DiTSmoothQuantConvRot = false; disabled.append("当前参数不支持的 SmoothQuant＋ConvRot")
+        }
+        guard !disabled.isEmpty else { return nil }
+        var notice = "图片编辑已关闭\(disabled.joined(separator: "、"))；DiT 缓存档位、参考编码与采样参数已保留。"
+        if acceleration?.policy == "gpu" && qwen21ReferenceSize == 1024 {
+            notice += "标准 1024 继续使用 GPU；如需固定 W8A8 ANE，可自行选择快速 512（近似预览）。"
+        }
+        return notice
+    }
     func qualifiedQwen21StagedANECache(systemJSON: String? = nil) -> Bool {
+        if operation == "image.edit" { return qualifiedQwen21StagedANEEdit(systemJSON: systemJSON) }
         guard modelID == "qwen-image-2.1", operation == "image.generate",
               acceleration?.policy == "gpu_ane",
               acceleration?.manifest.isEmpty == false, !usesRuntimeANE,
@@ -446,7 +515,7 @@ struct StudioDraft: Codable, Sendable {
     }
     func qwen21DiTW8A8Issue(systemJSON: String? = nil) -> String? {
         qualifiedQwen21StagedANECache(systemJSON: systemJSON) ? nil :
-            "DiT W8A8 仅支持 Apple M5 Pro / 24 GiB：512×512 文生图、20–40 步、固定量化 ANE 分区及分阶段加载，并关闭 LoRA、参考图、提示词增强和设备配置。"
+            "DiT W8A8 需要 Apple M5 Pro / 24 GiB、512×512、20–40 步、固定量化 ANE 分区及分阶段加载，关闭 LoRA、提示词增强和设备配置；编辑还需 1–3 张快速 512 参考图。"
     }
     var qwen21DiTCacheUnavailableReason: String? { qwen21DiTCacheIssue() }
     func qwen21DiTCacheIssue(systemJSON: String? = nil) -> String? {
@@ -455,7 +524,7 @@ struct StudioDraft: Codable, Sendable {
         if ![1024, 512].contains(effectiveQwen21ReferenceSize) { return "DiT 缓存支持标准 1024 或快速 512 参考编码。" }
         if qualifiedQwen21StagedANECache(systemJSON: systemJSON) { return nil }
         if (acceleration?.policy ?? (profilePath.isEmpty ? "gpu" : "profile")) != "gpu" || !profilePath.isEmpty {
-            return "DiT 缓存支持纯 GPU，或 Apple M5 Pro / 24 GiB 的固定量化分区：512×512 文生图、20–40 步、分阶段加载，并关闭参考图、LoRA、提示词增强与设备配置。"
+            return "DiT 缓存支持纯 GPU，或 Apple M5 Pro / 24 GiB 的固定 W8A8 分区：512×512、20–40 步、分阶段加载，编辑使用 1–3 张快速 512 参考图，并关闭 LoRA、提示词增强与设备配置。"
         }
         if !(20...40).contains(steps) { return "DiT 缓存需要 20–40 步；请自行调整采样步数。" }
         if width != 512 || height != 512 { return "DiT 缓存目前仅支持 512×512 画布。" }
@@ -846,7 +915,10 @@ struct StudioDraft: Codable, Sendable {
                 throw NativeFailure(message: "Qwen LoRA 仅支持 Transformer 角色。")
             }
         }
-        if let reason = qwen21ReferenceSizeIssue { throw NativeFailure(message: reason + " 可一键恢复标准 1024，其他参数保持不变。") }
+        if let reason = qwen21ANEEditingRequestIssue(systemJSON: systemJSON) { throw NativeFailure(message: reason) }
+        if !(modelID == "qwen-image-2.1" && usesANE && !usesRuntimeANE), let reason = qwen21ReferenceSizeIssue {
+            throw NativeFailure(message: reason + " 可一键恢复标准 1024，其他参数保持不变。")
+        }
         if qwen21DiTSmoothQuantConvRot, let reason = qwen21DiTSmoothQuantConvRotIssue(systemJSON: systemJSON) { throw NativeFailure(message: reason) }
         if qwen21DiTW8A8, let reason = qwen21DiTW8A8Issue(systemJSON: systemJSON) { throw NativeFailure(message: reason) }
         guard Qwen21DiTCacheMode(rawValue: qwen21DiTCache) != nil else { throw NativeFailure(message: "DiT 缓存档位无效，请选择关闭、保守、均衡或快速。") }
@@ -919,7 +991,7 @@ struct StudioDraft: Codable, Sendable {
         request.prompt_enhance = modelID == "qwen-image-2.1" && promptEnhance
         request.prompt_enhance_edit_experimental = modelID == "qwen-image-2.1" &&
             operation == "image.edit" && promptEnhance && promptEnhanceEditExperimental
-        request.prompt_enhancer_path = modelID == "qwen-image-2.1" && !promptEnhancerPath.isEmpty ? promptEnhancerPath : nil
+        request.prompt_enhancer_path = modelID == "qwen-image-2.1" && promptEnhance && !promptEnhancerPath.isEmpty ? promptEnhancerPath : nil
         request.qwen21_dit_cache = modelID == "qwen-image-2.1" ? qwen21DiTCache : nil
         // Omit the inactive extension so the existing Runtime ANE worker wire stays compatible.
         request.qwen21_dit_w8a8 = modelID == "qwen-image-2.1" && qwen21DiTW8A8 ? true : nil
@@ -975,15 +1047,15 @@ struct StudioDraft: Codable, Sendable {
                     guard Qwen21LowMemoryANEHardware.isEligible(systemJSON: systemJSON ?? NativeEngine.system()) else {
                         throw NativeFailure(message: "Qwen 低内存 ANE 实验仅适用于 Apple M5 Pro、24 GiB 内存；请关闭此实验选项。")
                     }
-                    guard operation == "image.generate", activeAssets.isEmpty,
-                          width == 512, height == 512, steps >= 2,
-                          residency == "component_staged", activeLoRAs.isEmpty,
-                          !promptEnhance,
-                          qwen21DiTCache == "off" || qualifiedQwen21StagedANECache(systemJSON: systemJSON) else {
-                        throw NativeFailure(message: "Qwen 低内存 ANE 仅支持 512×512 文生图、至少 2 步和分阶段加载；请关闭参考图、LoRA与提示词增强。DiT 缓存另需 20–40 步并关闭设备配置。")
+                    let textGeneration = operation == "image.generate" && activeAssets.isEmpty &&
+                        width == 512 && height == 512 && steps >= 2 &&
+                        residency == "component_staged" && activeLoRAs.isEmpty && !promptEnhance &&
+                        (qwen21DiTCache == "off" || qualifiedQwen21StagedANECache(systemJSON: systemJSON))
+                    guard textGeneration || qualifiedQwen21StagedANEEdit(systemJSON: systemJSON) else {
+                        throw NativeFailure(message: "Qwen 低内存 ANE 需要 512×512、分阶段加载并关闭 LoRA 与提示词增强；文生图至少 2 步，图片编辑需要 20–40 步和 1–3 张快速 512 参考图。")
                     }
                     request.qwen21_w8a8 = true
-                    request.qwen21_staged_fast = acceleration.qwen21W8A8 == true
+                    request.qwen21_staged_fast = operation == "image.edit" ? nil : acceleration.qwen21W8A8 == true
                     request.hybrid_mlp_mode = "base_fused"
                 }
             }
@@ -1341,6 +1413,13 @@ final class StudioState: ObservableObject {
             message = "此设备未启用当前权重的流式加载，已恢复常驻。"
             save()
         }
+        if normalizeQwen21EditingConfiguration() { save() }
+    }
+    @discardableResult
+    private func normalizeQwen21EditingConfiguration() -> Bool {
+        guard let notice = draft.normalizeQwen21EditingConfiguration() else { return false }
+        message = [message, notice].compactMap { $0 }.joined(separator: " ")
+        return true
     }
     var streamingQueryKey: String {
         // Include installation, prompt/token policy and every route input.
@@ -1498,7 +1577,8 @@ final class StudioState: ObservableObject {
               fields["modelID"] is String, fields["modelPaths"] is [String: String] else {
             throw NativeFailure(message: "请选择含 modelID 和 modelPaths 的 App 生成配置。")
         }
-        let imported = try JSONDecoder().decode(StudioDraft.self, from: data)
+        var imported = try JSONDecoder().decode(StudioDraft.self, from: data)
+        let editingNotice = imported.normalizeQwen21EditingConfiguration()
         try imported.validate(models: models)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: imported.modelPath, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -1509,17 +1589,24 @@ final class StudioState: ObservableObject {
         selected.modelPaths = draft.modelPaths.merging(imported.modelPaths.filter { !$0.value.isEmpty }) { _, incoming in incoming }
         draft = selected
         undoAssets = []
-        message = nil
+        message = editingNotice
         save()
         workspaceResetID = UUID()
     }
-    func setANEEnabled(_ enabled: Bool) {
+    func setANEEnabled(_ enabled: Bool, systemJSON: String? = nil) {
+        let fixedQwenEdit = draft.modelID == "qwen-image-2.1" && draft.operation == "image.edit" && !draft.usesRuntimeANE
+        if enabled && fixedQwenEdit, let issue = draft.qwen21ANEEditingConfigurationIssue(systemJSON: systemJSON) {
+            message = issue; return
+        }
         var config = draft.acceleration ?? StudioAcceleration()
         config.policy = enabled ? "gpu_ane" : "gpu"
         if !enabled { config.runtimeAneProfileID = nil; config.runtimeDescriptor = nil }
         config.automaticVersion = 1
         draft.profilePath = ""
         draft.acceleration = config
+        if enabled && fixedQwenEdit {
+            message = "图片编辑已选择固定 W8A8 ANE；使用快速 512 参考编码，图像细节可能变化。分区身份与容量会在生成前核对。"
+        } else { normalizeQwen21EditingConfiguration() }
     }
     @discardableResult func setQwen21ReferenceSize(_ size: Int) -> Bool {
         guard !imageInputsBusy, [1024, 512].contains(size) else { return false }
@@ -1576,6 +1663,7 @@ final class StudioState: ObservableObject {
                 draft.operation = sameKind
             }
             synchronizeUpscaleSource()
+            normalizeQwen21EditingConfiguration()
             return
         }
         if !model.supports(draft.operation) {
@@ -1620,6 +1708,7 @@ final class StudioState: ObservableObject {
             draft.operation = operation; draft.assets = assets; draft.initImageID = input
         }
         undoAssets = []; message = nil
+        normalizeQwen21EditingConfiguration()
         save()
         return true
     }
@@ -1680,6 +1769,7 @@ final class StudioState: ObservableObject {
         draft.operation = operation
         if draft.initImageID == nil { draft.initImageID = draft.assets.first?.id }
         synchronizeUpscaleSource()
+        normalizeQwen21EditingConfiguration()
     }
     func selectInstallation(modelID: String, path: String) {
         guard !imageInputsBusy, !path.isEmpty else { return }
@@ -1853,6 +1943,7 @@ final class StudioState: ObservableObject {
         if operation == "image.edit" { draft.assets = [asset] }
         draft.operation = operation; draft.initImageID = asset.id
         message = operation == "image.edit" ? "已使用这张图片进行单图编辑，其他参考图可撤销恢复。" : nil
+        normalizeQwen21EditingConfiguration()
     }
     @discardableResult
     func editResult(_ job: NativeJob) async -> Bool {
@@ -1883,6 +1974,7 @@ final class StudioState: ObservableObject {
             draft.assets = [asset]; draft.initImageID = asset.id; draft.operation = operation
             if draft.prompt == previousPrompt { draft.prompt = "" }
             message = "已将结果副本设为编辑原图，请输入修改要求。原结果已保留，参考图替换可撤销。"
+            normalizeQwen21EditingConfiguration()
             save()
             return true
         } catch {
@@ -1942,6 +2034,7 @@ final class StudioState: ObservableObject {
         acceleration.policy = "gpu"
         draft.acceleration = acceleration
         message = "已替换为可编辑的示例提示词，使用 GPU / \(steps) 步 / \(size.0)×\(size.1)。这不是模型提示词重写；蒙版与标注作为视觉参考，不保证逐像素锁定未编辑区。"
+        normalizeQwen21EditingConfiguration()
     }
     func applyQwen21TurboPreset() {
         guard !imageInputsBusy else { message = "请等待素材导入完成。"; return }
@@ -2006,6 +2099,7 @@ final class StudioState: ObservableObject {
                 message = "已在参考 \(index + 1) 使用标注副本；原文件未改动，可撤销。请在提示词中说明圈选 / 涂抹区域的修改，并要求移除标注。"
             }
             draft.operation = "image.edit"
+            normalizeQwen21EditingConfiguration()
             return true
         } catch {
             await importer.discard(staged)
@@ -2218,6 +2312,7 @@ final class StudioState: ObservableObject {
         draft.initImageID = draft.assets.first?.id; draft.strength = request.inputs?.first?.strength ?? 0.75
         undoAssets = []
         message = "已恢复此任务的模型、输入顺序与生成参数，请核对后重新生成。"
+        normalizeQwen21EditingConfiguration()
         save()
         workspaceResetID = UUID()
     }

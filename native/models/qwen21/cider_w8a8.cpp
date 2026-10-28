@@ -12,20 +12,33 @@
 #include <cstring>
 #include "smoothquant_convrot.hpp"
 #include "qwen21_sq_profile_generated.hpp"
+#include "qwen21_sq_edit_profile_generated.hpp"
 
 namespace tc::qwen21 {
-inline std::string sq_convrot_recipe() {
-    return std::string("dit-pc-w8a8-sq-a05-rht256-64-fp32-v1-") + sq_profile::payload_sha256;
+inline bool sq_edit(SqCalibration profile) { return profile == SqCalibration::Editing; }
+inline const uint16_t *sq_bits(SqCalibration profile) {
+    return sq_edit(profile) ? sq_edit_profile::inverse_bits : sq_profile::inverse_bits;
 }
-inline const sq_profile::Entry &sq_entry(const std::string &key, int k) {
-    for (const auto &entry : sq_profile::entries)
-        if (key == entry.key && k == entry.channels) return entry;
-    throw std::invalid_argument("No matching frozen SmoothQuant calibration for " + key);
+inline const char *sq_payload(SqCalibration profile) {
+    return sq_edit(profile) ? sq_edit_profile::payload_sha256 : sq_profile::payload_sha256;
 }
-inline Tensor sq_inverse_scale(const sq_profile::Entry &entry) {
+inline std::string sq_convrot_recipe(SqCalibration profile) {
+    return std::string(sq_edit(profile) ? "dit-pc-w8a8-sq-a05-rht256-64-fp32-edit-v1-"
+                                       : "dit-pc-w8a8-sq-a05-rht256-64-fp32-v1-") + sq_payload(profile);
+}
+struct SqEntry { int offset, channels; };
+inline SqEntry sq_entry(const std::string &key, int k, SqCalibration profile) {
+    auto lookup = [&](const auto &entries) -> SqEntry {
+        for (const auto &entry : entries)
+            if (key == entry.key && k == entry.channels) return {entry.offset, entry.channels};
+        throw std::invalid_argument("No matching frozen SmoothQuant calibration for " + key);
+    };
+    return sq_edit(profile) ? lookup(sq_edit_profile::entries) : lookup(sq_profile::entries);
+}
+inline Tensor sq_inverse_scale(const SqEntry &entry, SqCalibration profile) {
     std::vector<mx::float16_t> values(entry.channels);
     static_assert(sizeof(mx::float16_t) == sizeof(uint16_t));
-    std::memcpy(values.data(), sq_profile::inverse_bits + entry.offset, values.size() * 2);
+    std::memcpy(values.data(), sq_bits(profile) + entry.offset, values.size() * 2);
     return Tensor(values.data(), {entry.channels}, mx::float16);
 }
 
@@ -116,21 +129,23 @@ class CacheEntryLock {
     CacheEntryLock(const CacheEntryLock &) = delete;
 };
 CiderCache::CiderCache(const std::filesystem::path &root, const std::string &sha,
-                       std::function<void()> checkpoint, bool smoothquant_convrot)
-    : checkpoint_(std::move(checkpoint)), smoothquant_convrot_(smoothquant_convrot) {
+                       std::function<void()> checkpoint, bool smoothquant_convrot, SqCalibration calibration)
+    : checkpoint_(std::move(checkpoint)), smoothquant_convrot_(smoothquant_convrot), calibration_(calibration) {
+    cider_check(smoothquant_convrot || calibration == SqCalibration::Generation,
+                "Editing calibration requires SmoothQuant+ConvRot");
     cider_check(sha.size() == 64 && sha.find_first_not_of("0123456789abcdef") == std::string::npos,
                 "DiT W8A8 requires the verified checkpoint SHA-256");
     if (!checkpoint_) checkpoint_ = [] {};
     checkpoint_();
     if (smoothquant_convrot_)
-        cider_check(sha == sq_profile::source_sha256,
+        cider_check(sha == (sq_edit(calibration_) ? sq_edit_profile::source_sha256 : sq_profile::source_sha256),
                     "SmoothQuant+ConvRot requires the checkpoint matching its frozen calibration");
     receipt_.smoothquant_convrot = smoothquant_convrot_;
     if (smoothquant_convrot_) {
-        receipt_.calibration_sha256 = sq_profile::identity;
-        receipt_.calibration_payload_sha256 = sq_profile::payload_sha256;
+        receipt_.calibration_sha256 = sq_edit(calibration_) ? sq_edit_profile::identity : sq_profile::identity;
+        receipt_.calibration_payload_sha256 = sq_payload(calibration_);
     }
-    receipt_.recipe = smoothquant_convrot_ ? sq_convrot_recipe() : cider_recipe;
+    receipt_.recipe = smoothquant_convrot_ ? sq_convrot_recipe(calibration_) : cider_recipe;
     auto directory = root / receipt_.recipe / sha;
     std::filesystem::path partial;
     for (const auto &component : directory) {
@@ -142,7 +157,7 @@ CiderCache::CiderCache(const std::filesystem::path &root, const std::string &sha
 }
 inline std::vector<Tensor> cider_read_packed_cache(
         const std::filesystem::path &path, const std::string &key,
-        int n, int k, int group, mx::Dtype source_dtype, const std::string &sha, const std::string &recipe, bool transformed) {
+        int n, int k, int group, mx::Dtype source_dtype, const std::string &sha, const std::string &recipe, bool transformed, SqCalibration calibration) {
     if (!std::filesystem::is_regular_file(path))
         throw std::invalid_argument("Cider packed cache is missing or not a regular file: " + path.string());
     auto [arrays, metadata] = mx::load_safetensors(path.string());
@@ -172,8 +187,8 @@ inline std::vector<Tensor> cider_read_packed_cache(
     for (int i = 0; i < n; ++i)
         cider_check(float(bias[i]) == 0.f, "Cider packed cache bias must be zero");
     if (transformed) {
-        const auto &entry = sq_entry(key, k);
-        cider_check(std::memcmp(bias + n, sq_profile::inverse_bits + entry.offset, size_t(k) * 2) == 0,
+        const auto entry = sq_entry(key, k, calibration);
+        cider_check(std::memcmp(bias + n, sq_bits(calibration) + entry.offset, size_t(k) * 2) == 0,
                     "Cider cached inverse scales do not match the frozen calibration");
     }
     return bank;
@@ -211,13 +226,13 @@ std::vector<Tensor> CiderCache::pack(const Tensor &weight, const std::string &ke
     const int n = weight.shape(0), k = weight.shape(1);
     const int pn = cider_round_up(n, 128), pk = cider_round_up(k, 128);
     constexpr int group = 0;
-    if (smoothquant_convrot_) (void)sq_entry(key, k);
+    if (smoothquant_convrot_) (void)sq_entry(key, k, calibration_);
     auto path = cider_cache_path(receipt_.directory, key);
     CacheEntryLock lock(path, checkpoint_);
     checkpoint_();
     const auto started = std::chrono::steady_clock::now();
     if (std::filesystem::exists(path)) {
-        auto bank = cider_read_packed_cache(path, key, n, k, group, weight.dtype(), receipt_.source_sha256, receipt_.recipe, smoothquant_convrot_);
+        auto bank = cider_read_packed_cache(path, key, n, k, group, weight.dtype(), receipt_.source_sha256, receipt_.recipe, smoothquant_convrot_, calibration_);
         ++receipt_.hits; receipt_.bytes_read += std::filesystem::file_size(path);
         receipt_.read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         checkpoint_();
@@ -229,7 +244,7 @@ std::vector<Tensor> CiderCache::pack(const Tensor &weight, const std::string &ke
     auto fp = mx::astype(weight, mx::float32);
     auto sidecar = mx::zeros({n}, mx::float16);
     if (smoothquant_convrot_) {
-        auto inverse = sq_inverse_scale(sq_entry(key, k));
+        auto inverse = sq_inverse_scale(sq_entry(key, k, calibration_), calibration_);
         // Pair with the exact reciprocal of the stored, rounded FP16 inverse.
         fp = sq_convrot_rotate(fp / mx::astype(inverse, mx::float32));
         sidecar = mx::reshape(mx::concatenate({sidecar, inverse}), {1, n+k});

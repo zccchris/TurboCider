@@ -27,6 +27,58 @@ for normal operation. The experimental GPU+ANE route requires an explicit
 manifest and approximation opt-in; it is not hardware-placement or image-quality
 proof.
 
+## M5 Pro / 24 GiB staged editing
+
+The App's frozen W8A8 partition can also serve image editing on Apple M5 Pro
+with 24 GiB memory. Select a 512×512 canvas, 20–40 steps, component-staged
+residency and 1–3 references using **快速 512** encoding. In **高级加速与缓存配置**,
+enable ANE and choose the existing checkpoint-matched, 32-block, 1024-row,
+6144-channel compiled W8A8 manifest. LoRA, prompt enhancement, device profiles
+and Runtime ANE are outside this route.
+
+DiT cache presets and the optional **DiT W8A8＋离线缓存** switch remain available
+for these edits. The default edit keeps BF16 GPU weights; it does not inherit
+the generation route's implicit W4 caches. **SmoothQuant＋ConvRot** is also
+available after enabling DiT W8A8. Editing automatically selects a separate
+embedded calibration captured with 1, 2 and 3 reference images; generation
+continues to use its original profile. Each transformed recipe prepares its
+own roughly 11 GiB disk cache on first use. The option defaults off and trades
+extra compute for closer agreement with floating-point DiT on the tested
+samples; it is not an additional speed guarantee. See the
+[editing calibration validation](../status/qwen21-edit-smoothquant-2026-10-28.md).
+Resizing and W8A8/cache approximations can change reference details.
+
+For CLI/SDK use, set `qwen21_dit_w8a8: true` and
+`qwen21_dit_smoothquant_convrot: true` on the staged editing request.
+`qwen21_staged_fast` controls generation's GPU W4 defaults and is not required
+for editing. The App identifies ANE precision from the selected manifest;
+turning off the GPU W4 switch does not disable ANE, DiT W8A8 or SmoothQuant.
+
+The visual encoder, streamed language layers, streamed DiT and VAE run in
+separate phases. Reference prefix KV remains available within the denoising
+request; cross-request DiT prefix snapshots are disabled for this bounded
+route. Memory admission includes reference tokens and rechecks their actual
+32-aligned resized dimensions before encoding. Base GPU edits with up to three
+512/1024 references also use staged layer release on this device.
+
+Switching a generated result, annotation, saved configuration or Playground
+template into editing preserves compatible acceleration selections. Unsupported
+generation-only settings are disabled with a notice; the selected reference
+size, sampling parameters and DiT cache preset are retained. Standard 1024
+reference encoding continues to use GPU in the App.
+
+For CLI/SDK use, see
+[`qwen21-staged-edit-512.json`](../../examples/requests/qwen21-staged-edit-512.json).
+Replace the reference, manifest and output paths with local paths.
+
+The [October 28 validation](../design/validation/qwen21-staged-edit-2026-10-28.json)
+covers real 20-step editing with one reference, GPU and frozen W8A8, DiT W8A8
+with balanced cache, cancellation and retry. The repeated W8A8 result is
+byte-identical to its retry and reuses the existing disk cache. Small native
+fixtures additionally exercise three references and streamed prefix lifetimes.
+This establishes execution and lifecycle behavior, not general image fidelity
+or a measured speedup.
+
 ## Turbo checkpoint (native research support)
 
 The original `qwen_image_2.1_turbo_bf16.safetensors` can now be installed in a

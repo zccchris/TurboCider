@@ -1,0 +1,105 @@
+{
+  "date": "2026-10-28",
+  "base_commit": "8acc9ecb",
+  "device": {
+    "gpu": "Apple M5 Pro",
+    "memory_bytes": 25769803776,
+    "mlx": "0.32.0"
+  },
+  "scope": "functional editing and lifecycle validation; not a speed benchmark",
+  "library_sha256": "493d3833688bfe157963f4a0e1f9ff54f568311c796d1501f3c55a6563f0c4cc",
+  "request": {
+    "width": 512,
+    "height": 512,
+    "steps": 20,
+    "seed": 42,
+    "references": 1,
+    "reference_size": 512,
+    "instruction": "Change fox fur to blue; preserve pose and snowy background"
+  },
+  "runs": [
+    {
+      "name": "gpu",
+      "status": 0,
+      "actual_steps": 20,
+      "ane_runtime_calls": null,
+      "ane_runtime_failures": null,
+      "cached_steps": null,
+      "dit_disk_cache_hits": null,
+      "active_mlx_bytes_after": 17203722,
+      "caller_wired_limit_restored": true,
+      "png_sha256": "36ee21e03000b71a739faf26cb64408698180beb176f88663aceab56e22de947"
+    },
+    {
+      "name": "hybrid",
+      "status": 0,
+      "actual_steps": 20,
+      "ane_runtime_calls": 608,
+      "ane_runtime_failures": 0,
+      "cached_steps": null,
+      "dit_disk_cache_hits": null,
+      "active_mlx_bytes_after": 17204292,
+      "caller_wired_limit_restored": true,
+      "png_sha256": "1faf1dbafe2d8ece748c71278a07dbd12473ae372040a9b67fcb3534a72eb826"
+    },
+    {
+      "name": "cancel-dit",
+      "status": 2,
+      "actual_steps": null,
+      "ane_runtime_calls": null,
+      "ane_runtime_failures": null,
+      "cached_steps": null,
+      "dit_disk_cache_hits": null,
+      "active_mlx_bytes_after": 17204328,
+      "caller_wired_limit_restored": true,
+      "png_sha256": null
+    },
+    {
+      "name": "retry-dit",
+      "status": 0,
+      "actual_steps": 20,
+      "ane_runtime_calls": 440,
+      "ane_runtime_failures": 0,
+      "cached_steps": 7,
+      "dit_disk_cache_hits": 392,
+      "active_mlx_bytes_after": 17204790,
+      "caller_wired_limit_restored": true,
+      "png_sha256": "ba441b0e17407635925568384913d31c678c2341695f3e0bdc2cd99b06a41b62"
+    },
+    {
+      "name": "repeat-dit",
+      "status": 0,
+      "actual_steps": 20,
+      "ane_runtime_calls": 440,
+      "ane_runtime_failures": 0,
+      "cached_steps": 7,
+      "dit_disk_cache_hits": 392,
+      "active_mlx_bytes_after": 17205228,
+      "caller_wired_limit_restored": true,
+      "png_sha256": "ba441b0e17407635925568384913d31c678c2341695f3e0bdc2cd99b06a41b62"
+    }
+  ],
+  "checks": {
+    "qwen_request_contracts": {
+      "passed": 64
+    },
+    "edit_memory_admission": "pass",
+    "mlx_edit_prefill_decode_and_cancel_retry": "pass",
+    "mlx_staged_attention": "pass",
+    "mlx_dit_w8a8": "pass",
+    "swift_qwen_workflow": "pass",
+    "swift_playground": "pass",
+    "packaged_cli_self_test": "pass",
+    "package_signature": "pass",
+    "full_make_test": "fails at VDN GPU solve precision threshold; reproduced using the pre-existing library",
+    "post_failure_inventory": "pass",
+    "make_test_app": "pass"
+  },
+  "limitations": [
+    "One complete-model reference image and seed; no broad edit fidelity claim.",
+    "W8A8 and DBCache outputs differ from GPU baseline.",
+    "Core ML runtime calls are verified; physical ANE residency remains unknown.",
+    "Full DiT cache hits were warm; this is not a cold-cache performance measurement."
+  ],
+  "retry_matches_repeat": true
+}

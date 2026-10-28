@@ -64,8 +64,15 @@ void configuration() {
     config.layers = 1;
     tc::qwen21::Transformer nonstandard(empty, config);
     nonstandard.configure_staged_optimizations(0, false);
-    rejects([&] { nonstandard.configure_staged_optimizations(4, false); },
-            "attention cache accepted nonstandard transformer geometry");
+    nonstandard.configure_staged_optimizations(4, false);
+    tc::require(nonstandard.staged_attention_bits() == 4,
+                "aligned attention cache incorrectly depends on layer count");
+    auto unaligned_config = config;
+    unaligned_config.heads = 1; unaligned_config.head_dim = 64;
+    unaligned_config.rope_axes = {16, 16, 32};
+    tc::qwen21::Transformer unaligned(empty, unaligned_config);
+    rejects([&] { unaligned.configure_staged_optimizations(4, false); },
+            "attention cache accepted unaligned hidden dimensions");
     rejects([&] { nonstandard.configure_staged_optimizations(0, true); },
             "Q/K fusion accepted nonstandard transformer geometry");
 }

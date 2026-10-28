@@ -1,0 +1,23 @@
+{
+  "model": "qwen-image-2.1",
+  "operation": "image.edit",
+  "prompt": "Change the subject to blue while preserving its shape and background.",
+  "width": 512,
+  "height": 512,
+  "steps": 20,
+  "seed": 42,
+  "execution": "gpu_ane",
+  "residency": "component_staged",
+  "allow_approximation": true,
+  "ane_manifest": "/path/to/compiled-w8a8-6144/manifest.json",
+  "hybrid_mlp_mode": "base_fused",
+  "qwen21_w8a8": true,
+  "qwen21_dit_w8a8": false,
+  "qwen21_dit_smoothquant_convrot": false,
+  "qwen21_dit_cache": "off",
+  "qwen21_reference_size": 512,
+  "inputs": [
+    {"kind": "image", "role": "reference", "path": "/path/to/reference.png"}
+  ],
+  "output": "/path/to/edited.png"
+}

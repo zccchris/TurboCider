@@ -678,7 +678,14 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
     }
     auto plan = make_plan(r);
     const auto device = device_info();
-    const bool layer_staged = layer_staged_t2i(r, device);
+    const bool staged_hybrid_edit = layer_staged_hybrid_edit(r, device);
+    const bool staged_edit = layer_staged_edit(r, device) || staged_hybrid_edit;
+    const bool layer_staged = layer_staged_t2i(r, device) || staged_edit;
+    // An old prefix bank must not overlap the next edit's visual/language
+    // encoding. Request-local prefix KV remains available during denoising.
+    if (staged_edit) clear_prefix_snapshot();
+    require(!staged_edit || (!packed_transformer && !gguf_encoder),
+            "Qwen21 layer-staged editing requires original BF16 checkpoints");
     const bool staged_qualified = qualified_staged_optimizations(r, device);
     const auto staged_options = staged_optimization_options(r, device);
     std::shared_ptr<CiderCache> cider_cache;
@@ -696,9 +703,9 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
                     r.dump.empty() && r.noise_path.empty(),
                 "Qwen block observer requires ordinary 512px BaseOnly staged20 generation/resident40 generation or standard-reference editing, or pinned student GPU diagnostics; no other executor/cache diagnostics");
     }
-    require(!layer_staged || (!fused_qkv && (!db_cache || staged_qualified) && !reuse_final_ffn &&
+    require(!layer_staged || (!fused_qkv && (!db_cache || staged_qualified || staged_edit) && !reuse_final_ffn &&
                 !half_reuse_ffn && !hybrid_reuse_ffn && !hybrid_reuse_last16),
-            "Qwen21 layer-staged T2I does not support diagnostic QKV/FFN caches");
+            "Qwen21 layer-staged requests do not support diagnostic QKV/FFN caches");
     require(!r.prompt.empty(), "Qwen21 requires a prompt");
     require(warmup || prepare_only || (!r.output.empty() && std::filesystem::path(r.output).extension() == ".png"),
             "Qwen21 requires a .png output");
@@ -889,6 +896,23 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
         }
         if(!reference_values[i])images[i]=resize_reference(load_rgba_image_tensor(r.inputs[i].path),r.qwen21_reference_size);
     }
+    if (staged_edit) {
+        uint64_t reference_tokens = 0;
+        if (edit_hit) {
+            for (const auto &ref : conditioning_cache_.edit->reference_latents)
+                reference_tokens += uint64_t(ref.latents.shape(1));
+        } else for (size_t i = 0; i < images.size(); ++i) {
+            reference_tokens += reference_values[i]
+                ? uint64_t(reference_values[i]->height) * reference_values[i]->width
+                : uint64_t(images[i]->shape(1) / 16) * (images[i]->shape(2) / 16);
+        }
+        // The 32-aligned resize can exceed the nominal reference area for
+        // narrow aspect ratios. Admit its actual prefix before encoder/DiT I/O.
+        plan.memory_estimate_bytes = staged_hybrid_edit
+            ? staged_hybrid_edit_memory_estimate(r, reference_tokens)
+            : staged_edit_memory_estimate(r, reference_tokens);
+        ResidencyPolicy::validate_budget(plan, device.physical_memory);
+    }
     const bool hit = encoder_capture_path.empty() && (edit_hit || (r.inputs.empty() && conditioning_cache_.text_hit(r.prompt)));
     if(hit && encoder_runtime_) {
         encoder_runtime_->begin_request(); // resident admission also on condition-cache hits
@@ -1060,8 +1084,15 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
         }
         std::function<void(const std::string &)> release_layer;
         if (layer_staged) {
+            // Deepstack tensors are lazy too: complete every visual reader
+            // before dropping vision weights, then consume language layers.
             mx::eval(assembled.embeddings);
+            mx::eval(assembled.deepstack_deltas);
+            refs.clear();
+            weights.erase_prefix("model.visual.");
             weights.erase("model.embed_tokens.weight");
+            weights.erase("model.language_model.embed_tokens.weight");
+            mx::clear_cache();
             release_layer = [&](const std::string &prefix) { weights.erase_prefix(prefix); };
         }
         if(metal_encoder_requested)text=assembled.retain(native_encoder_->language(weights,assembled.embeddings,assembled.positions,
@@ -1662,7 +1693,9 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
             dit_source->revalidate_after_drain();
             cider_cache = std::make_shared<CiderCache>(qwen21_dit_cache_root(),
                 hybrid_->verified_checkpoint_sha256, [&cancelled] { checkpoint(cancelled); },
-                r.qwen21_dit_smoothquant_convrot);
+                r.qwen21_dit_smoothquant_convrot,
+                r.qwen21_dit_smoothquant_convrot && r.operation == "image.edit"
+                    ? SqCalibration::Editing : SqCalibration::Generation);
         }
         if (r.qwen21_dit_w8a8 || !hybrid_mlp_ || hybrid_runtime_options_ != runtime_options) {
             hybrid_mlp_.reset();
@@ -1884,6 +1917,9 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
     if (staged_options.qk_norm_rope || option_enabled(norm_rope))
         result.selection += "; experimental fused Metal Q/K norm-RoPE";
     result.timings.hybrid = (hybrid_requested || runtime_requested || qkv_requested) ? seconds(hybrid_start) : 0;
+    if (staged_edit) result.selection += staged_hybrid_edit
+        ? "; layer-streamed W8A8 ANE edit with staged vision/text/DiT/VAE"
+        : "; layer-streamed BF16 edit with staged vision/text/DiT/VAE";
     result.checkpoint = transformer_source_.filename().string();
     if(turbo)result.selection+="; "+std::string(turbo_sampler_identity)+"; original Turbo checkpoint, not base/student schedule";
     if(convrot_transformer) {
@@ -2043,7 +2079,7 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
             transformer_.erase_prefix(prefix);
             checkpoint(cancelled);
         });
-        if (staged_qualified)
+        if (staged_qualified || staged_hybrid_edit)
             dit.configure_staged_optimizations(staged_options.attention_bits, staged_options.qk_norm_rope, cider_cache);
         const uint64_t snapshot_memory_limit = r.memory_budget_bytes
             ? std::min(physical_bytes, r.memory_budget_bytes) : physical_bytes;
@@ -2060,7 +2096,7 @@ RunResult Session::run(const Request &requested, const Event &event, std::atomic
             require(runtime_functions.empty() || runtime_ffn_->metrics().runtime_weight_function_rows==runtime_functions,
                 "runtime prefix cannot reuse a different loaded function family");
         }
-        const bool snapshot_allowed = snapshot_route && prefix_bytes <= snapshot_budget && runtime_snapshot_healthy;
+        const bool snapshot_allowed = snapshot_route && !staged_edit && prefix_bytes <= snapshot_budget && runtime_snapshot_healthy;
         const auto checkpoint_path = transformer_source_;
         const std::string snapshot_runtime = snapshot_allowed ? prefix_runtime + ":" +
             (snapshot_with_db_cache ? "conservative-prefix-snapshot-v1:" : "") +

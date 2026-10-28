@@ -409,6 +409,99 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(code, 0, error)
             self.assertGreater(other['memory_estimate_bytes'] + (4 << 30), 24 << 30)
 
+    def test_qwen21_layer_staged_edit_preserves_precision_and_cache_opt_in(self):
+        refs = [dict(kind='image', role='reference', path=f'ref-{i}.png') for i in range(3)]
+        base = dict(model='qwen-image-2.1', operation='image.edit', prompt='Make it blue',
+                    width=512, height=512, steps=25, frames=1, audio=False,
+                    execution='gpu', residency='component_staged')
+        with qwen21_staged_environment():
+            for size in (512, 1024):
+                for count in (1, 2, 3):
+                    for mode in ('off', 'conservative', 'balanced', 'fast'):
+                        approximation = size != 1024 or mode != 'off'
+                        request = {**base, 'inputs': refs[:count], 'qwen21_reference_size': size,
+                                   'qwen21_dit_cache': mode, 'allow_approximation': approximation,
+                                   'prompt_enhancer_path': '/persisted-but-disabled-pe'}
+                        with self.subTest(size=size, count=count, mode=mode):
+                            code, result, error = plan(request)
+                            self.assertEqual(code, 0, error)
+                            self.assertEqual(result['memory_estimate_bytes'] + (4 << 30) <= 24 << 30,
+                                             qwen21_streaming_device())
+                            self.assertEqual(result['qwen21_dit_cache'], mode)
+                            self.assertFalse(result['qwen21_dit_w8a8'])
+                            self.assertFalse(result['qwen21_dit_smoothquant_convrot'])
+                            labels = result['algorithm_approximations']
+                            self.assertEqual('qwen21_decode_dit_cache' in labels, mode != 'off')
+                            self.assertFalse(any('staged_' in item for item in labels), labels)
+            for extra in (dict(residency='resident'), dict(width=768),
+                          dict(inputs=refs + refs[:1]),
+                          dict(lora_strategy='inference_time', allow_approximation=True,
+                               loras=[dict(path='ordinary.safetensors', strength=.5, role='transformer')])):
+                code, result, error = plan({**base, 'inputs': refs[:1], **extra})
+                self.assertEqual(code, 0, error)
+                self.assertGreater(result['memory_estimate_bytes'] + (4 << 30), 24 << 30)
+
+    def test_qwen21_layer_staged_w8a8_edit_and_dit_cache(self):
+        refs = [dict(kind='image', role='reference', path=f'ref-{i}.png') for i in range(3)]
+        base = dict(model='qwen-image-2.1', operation='image.edit', prompt='Make it blue',
+                    width=512, height=512, steps=20, frames=1, audio=False,
+                    execution='gpu_ane', residency='component_staged',
+                    qwen21_w8a8=True, allow_approximation=True, qwen21_reference_size=512,
+                    ane_manifest='/verified-at-execution.json', inputs=refs[:1])
+        qualified = qwen21_streaming_device()
+        with qwen21_staged_environment():
+            for count in (1, 2, 3):
+                for steps in (20, 25, 40):
+                    for mode in ('off', 'conservative', 'balanced', 'fast'):
+                        for full_dit in (False, True):
+                            request = {**base, 'inputs': refs[:count], 'steps': steps,
+                                       'qwen21_dit_cache': mode, 'qwen21_dit_w8a8': full_dit,
+                                       'prompt_enhancer_path': '/persisted-but-disabled-pe'}
+                            with self.subTest(count=count, steps=steps, mode=mode, full_dit=full_dit):
+                                code, result, error = plan(request)
+                                if not qualified and (mode != 'off' or full_dit):
+                                    self.assertNotEqual(code, 0)
+                                    continue
+                                self.assertEqual(code, 0, error)
+                                self.assertEqual(result['memory_estimate_bytes'] + (4 << 30) <= 24 << 30,
+                                                 qualified)
+                                self.assertEqual(result['qwen21_dit_cache'], mode)
+                                self.assertEqual(result['qwen21_dit_w8a8'], full_dit)
+                                self.assertFalse(result['qwen21_dit_smoothquant_convrot'])
+                                labels = result['algorithm_approximations']
+                                self.assertIn('qwen21_decode_mlp_w8a8_per_tensor', labels)
+                                self.assertEqual('qwen21_decode_dit_cache' in labels, mode != 'off')
+                                self.assertEqual('qwen21_metal_qk_norm_rope' in labels, qualified)
+                                self.assertFalse(any('w4' in item for item in labels), labels)
+                                if full_dit:
+                                    self.assertIn('w8a8_dit_pc', result['precision'])
+                                else:
+                                    self.assertEqual(result['precision'], 'bf16_gpu+w8a8_mlp_fp16_io')
+            for count in (1, 2, 3):
+                for steps in (20, 40):
+                    for mode in ('off', 'conservative', 'balanced', 'fast'):
+                        code, result, error = plan({**base, 'inputs': refs[:count], 'steps': steps,
+                            'qwen21_dit_cache': mode, 'qwen21_dit_w8a8': True,
+                            'qwen21_dit_smoothquant_convrot': True, 'qwen21_staged_fast': False})
+                        self.assertEqual(code == 0, qualified, error)
+                        if qualified:
+                            self.assertTrue(result['qwen21_dit_smoothquant_convrot'])
+                            self.assertLessEqual(result['memory_estimate_bytes'] + (4 << 30), 24 << 30)
+            code, _, error = plan({**base, 'qwen21_dit_w8a8': False,
+                                   'qwen21_dit_smoothquant_convrot': True})
+            self.assertNotEqual(code, 0)
+            self.assertIn('requires DiT W8A8', error)
+            for extra in (dict(qwen21_reference_size=256), dict(steps=19), dict(steps=41),
+                          dict(inputs=refs + refs[:1]), dict(residency='resident'),
+                          dict(hybrid_mlp_mode='runtime')):
+                code, _, _ = plan({**base, 'qwen21_dit_w8a8': True, 'qwen21_dit_smoothquant_convrot': True, **extra})
+                self.assertNotEqual(code, 0, extra)
+            for extra in (dict(qwen21_reference_size=256), dict(steps=19), dict(steps=41),
+                          dict(residency='resident')):
+                code, result, error = plan({**base, **extra})
+                self.assertEqual(code, 0, error)
+                self.assertGreater(result['memory_estimate_bytes'] + (4 << 30), 24 << 30)
+
     def test_qwen21_ane_only_keeps_staging_without_gpu_quantization(self):
         base = dict(model='qwen-image-2.1', operation='image.generate', prompt='A fox',
                     width=512, height=512, steps=25, audio=False, frames=1,
@@ -1504,9 +1597,12 @@ class ContractTests(unittest.TestCase):
                             for i in range(count)]
                     code, result, error = plan({**request, 'operation':'image.edit', 'inputs':refs})
                     self.assertEqual(code, 0, error)
-                    self.assertEqual(result['memory_estimate_bytes'],
-                                     empty['memory_estimate_bytes'] + count * per_reference +
-                                     ((6 << 30) if residency == 'component_staged' and qwen21_streaming_device() else 0))
+                    if residency == 'component_staged' and qwen21_streaming_device() and count <= 3:
+                        expected = max(16 << 30, (10 << 30) + 512 * 512 * 10240 + count * per_reference)
+                    else:
+                        expected = empty['memory_estimate_bytes'] + count * per_reference + (
+                            (6 << 30) if residency == 'component_staged' and qwen21_streaming_device() else 0)
+                    self.assertEqual(result['memory_estimate_bytes'], expected)
                     self.assertEqual(result['memory_estimate_kind'], 'conservative_heuristic_not_hard_limit')
                     if count == 10:
                         # Actual 512-square ten-reference MLX peak; not total

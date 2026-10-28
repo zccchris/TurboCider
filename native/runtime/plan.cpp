@@ -283,6 +283,13 @@ static ExecutionPlan make_plan_impl(
         plan.memory_estimate_bytes = (base_gib << 30) +
                                      (hybrid && !staged_hybrid ? hybrid_gib << 30 : 0) + uint64_t(r.width) * r.height * 10240 +
                                      uint64_t(r.inputs.size()) * (reference_prefix_bytes + (512ull << 20));
+        if (qwen21::layer_staged_edit(r, device) || qwen21::layer_staged_hybrid_edit(r, device)) {
+            const uint64_t nominal_tokens = uint64_t(r.inputs.size()) *
+                uint64_t(r.qwen21_reference_size / 16) * (r.qwen21_reference_size / 16);
+            plan.memory_estimate_bytes = qwen21::layer_staged_hybrid_edit(r, device)
+                ? qwen21::staged_hybrid_edit_memory_estimate(r, nominal_tokens)
+                : qwen21::staged_edit_memory_estimate(r, nominal_tokens);
+        }
         // Pinned r128 factors occupy about 648 MiB; native shared rank/gate/up
         // scratch adds roughly 50 MiB at short prompts. Explicit heuristic
         // headroom does not grant full-request memory certification.

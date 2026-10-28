@@ -31,6 +31,8 @@ BUILD_SCRIPTS = (
     "tools/native/embed_qwen21_sq_profile.py",
     "native/models/qwen21/calibration/sq_convrot_v1.json",
     "native/models/qwen21/calibration/sq_convrot_v1.f16le",
+    "native/models/qwen21/calibration/sq_convrot_edit_v1.json",
+    "native/models/qwen21/calibration/sq_convrot_edit_v1.f16le",
     "tools/native/embed_qwen21_cider_kernels.py", "tools/native/dependencies.sh",
     "tools/native/generate_runtime_build_identity.py",
     "tools/native/generate_bundled_streaming_catalog.py",

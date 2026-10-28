@@ -289,6 +289,7 @@ import ImageIO
             try check(request.qwen21_w8a8 == true && request.qwen21_dit_cache == "off" && request.steps == steps,
                       "Cache integration changed the existing uncached 2+-step low-memory ANE route")
         }
+        try await verifyEditingAccelerationMigration(root: root, fixture: fixture, assets: original)
         try await verifyTurboAndEditing(root: root, fixture: fixture, assets: original)
         try verifyDiTCacheAndOrdinaryLoRA(root: root, fixture: fixture, assets: original)
         let expectedCanvases = [(2048, 2048), (2400, 1792), (1792, 2400),
@@ -609,6 +610,207 @@ import ImageIO
         studio.reuse(oldJob)
         try check(studio.draft.qwen21DiTCache == "off", "Old history reused stale cache approximation")
         print("PASS Qwen DiT mode serialization/persistence/history/capabilities and ordinary-vs-Viggle LoRA (CPU only)")
+    }
+
+    @MainActor static func verifyEditingAccelerationMigration(root: URL, fixture: URL, assets: [StudioAsset]) async throws {
+        func check(_ value: @autoclosure () throws -> Bool, _ reason: String) throws {
+            if try !value() { throw NativeFailure(message: reason) }
+        }
+        let directory = root.appendingPathComponent("editing-migration")
+        let eligibleHardware = #"{"gpu":"Apple M5 Pro","physical_memory_bytes":25769803776}"#
+        let studio = StudioState(directory: directory)
+        studio.selectModel("qwen-image-2.1")
+        studio.draft.modelPaths[studio.draft.modelID] = root.path
+        studio.draft.prompt = "Make the teapot red; preserve its shape."
+        studio.draft.assets = Array(assets.prefix(2))
+        studio.draft.acceleration = StudioAcceleration(policy: "gpu_ane", manifest: root.appendingPathComponent("w8a8.json").path, qwen21W8A8: true)
+        studio.draft.qwen21DiTW8A8 = true
+        studio.draft.qwen21DiTSmoothQuantConvRot = true
+        studio.draft.qwen21DiTCache = "fast"
+        let generation = studio.draft
+        let output = root.appendingPathComponent("editing-migration-unused.png")
+        func verifyEditable(_ state: StudioState, _ context: String, noticeExpected: Bool = true) throws {
+            let request = try state.draft.request(output: output, systemJSON: "{}")
+            try check(request.operation == "image.edit" && request.execution == "gpu" &&
+                      request.qwen21_w8a8 == nil && request.qwen21_dit_w8a8 == nil &&
+                      request.qwen21_dit_smoothquant_convrot == nil && request.ane_manifest == nil &&
+                      request.qwen21_dit_cache == "fast" && request.allow_approximation == true &&
+                      request.residency == "component_staged" && request.steps == generation.steps &&
+                      request.width == generation.width && request.height == generation.height &&
+                      request.seed == Int(generation.seedText),
+                      "Editing migration lost supported GPU optimizations or sampling parameters: \(context)")
+            try check(state.draft.acceleration?.manifest == generation.acceleration?.manifest &&
+                      (!noticeExpected || state.message?.contains("图片编辑已关闭") == true),
+                      "Editing migration lost the registered manifest or explanation: \(context)")
+            _ = try NativeEngine.plan(request)
+        }
+        studio.changeOperation("image.edit")
+        try verifyEditable(studio, "operation picker")
+        try check(studio.draft.prompt == generation.prompt && studio.draft.assets == generation.assets,
+                  "Operation switch changed prompt or references")
+        studio.setANEEnabled(true, systemJSON: eligibleHardware)
+        try verifyEditable(studio, "ANE toggle during editing", noticeExpected: false)
+        try check(studio.message?.contains("标准 1024") == true && studio.draft.qwen21ReferenceSize == 1024,
+                  "ANE toggle silently changed standard reference encoding")
+        studio.draft = generation
+        studio.useOnlyAssetForEditing(assets[0].id)
+        try verifyEditable(studio, "single reference")
+        try check(studio.draft.assets == [assets[0]], "Single-image entry lost selected reference")
+        studio.draft = generation
+        studio.applyQwen21Example(.maskEdit)
+        try verifyEditable(studio, "prompt example")
+        studio.draft = generation
+        let stroke = Qwen21AnnotationStroke(tool: .ellipse,
+            points: [CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.6, y: 0.6)], width: 0.05)
+        let annotated = await studio.annotateQwen21Asset(assets[0].id, strokes: [stroke])
+        try check(annotated, "Annotation entry failed")
+        try verifyEditable(studio, "annotation")
+        studio.draft = generation
+        let masked = await studio.annotateQwen21Asset(assets[0].id, strokes: [stroke], output: .separateMask)
+        try check(masked && studio.draft.assets.count == 3, "Separate-mask entry failed")
+        try verifyEditable(studio, "separate mask")
+        studio.draft = generation
+        let generatedRequest = try generation.request(output: fixture,
+            systemJSON: #"{"gpu":"Apple M5 Pro","physical_memory_bytes":25769803776}"#)
+        let generatedJob = NativeJob(id: UUID(), createdAt: Date(), request: generatedRequest,
+            state: "succeeded", phase: "complete", completed: 40, total: 40, elapsed: 1, modelPath: root.path)
+        let edited = await studio.editResult(generatedJob)
+        try check(edited, "Generated result entry failed")
+        // Result editing intentionally asks for a fresh edit instruction.
+        studio.draft.prompt = generation.prompt
+        try verifyEditable(studio, "generated result")
+        var incompatible = generation
+        incompatible.operation = "image.edit"
+        let configuration = root.appendingPathComponent("incompatible-editing-configuration.json")
+        try JSONEncoder().encode(incompatible).write(to: configuration)
+        try studio.importConfiguration(from: configuration)
+        try verifyEditable(studio, "configuration import")
+        var historical = generatedRequest
+        historical.operation = "image.edit"
+        historical.inputs = [NativeInput(kind: "image", role: "reference", path: fixture.path)]
+        studio.reuse(NativeJob(id: UUID(), createdAt: Date(), request: historical,
+            state: "failed", phase: "error", completed: 0, total: 40, elapsed: 0, modelPath: root.path))
+        try verifyEditable(studio, "historical editing draft")
+        // Reproduce a saved editing draft before any reference has been added.
+        incompatible.assets = []
+        studio.draft = incompatible
+        studio.save()
+        let restored = StudioState(directory: directory)
+        try check(restored.draft.operation == "image.edit" && restored.draft.assets.isEmpty &&
+                  restored.draft.acceleration?.policy == "gpu" && !restored.draft.qwen21DiTW8A8 &&
+                  !restored.draft.qwen21DiTSmoothQuantConvRot && restored.draft.qwen21DiTCache == "fast" &&
+                  restored.message?.contains("图片编辑已关闭") == true,
+                  "Startup left the saved editing draft blocked by text-to-image optimization flags")
+        let persisted = try JSONDecoder().decode(StudioDraft.self,
+            from: Data(contentsOf: directory.appendingPathComponent("studio-draft.json")))
+        try check(persisted.acceleration?.policy == "gpu" && !persisted.qwen21DiTW8A8,
+                  "Startup repair was not persisted")
+        await restored.addFiles([fixture])
+        // Import updates the ordinary status message; migration was checked above.
+        try verifyEditable(restored, "restored draft after import", noticeExpected: false)
+        var pe = generation
+        pe.operation = "image.edit"; pe.promptEnhance = true; pe.promptEnhancerPath = "/test/pe-t2i"
+        let peNotice = pe.normalizeQwen21EditingConfiguration()
+        try check(!pe.promptEnhance && pe.promptEnhancerPath == "/test/pe-t2i" &&
+                  peNotice?.contains("文生图提示词增强") == true,
+                  "Editing inherited text-only PE or lost its installation")
+        let disabledPERequest = try pe.request(output: output, systemJSON: "{}")
+        try check(disabledPERequest.prompt_enhancer_path == nil &&
+                  disabledPERequest.prompt_enhance_edit_experimental == false,
+                  "Disabled PE leaked a path or experimental flag into the native editing memory policy")
+        pe.promptEnhance = true; pe.promptEnhanceEditExperimental = true
+        try check(pe.normalizeQwen21EditingConfiguration() == nil && pe.promptEnhance,
+                  "Explicit PE-I2I opt-in was removed")
+        var unchangedGeneration = generation
+        try check(unchangedGeneration.normalizeQwen21EditingConfiguration() == nil &&
+                  unchangedGeneration.qwen21DiTW8A8 && unchangedGeneration.qwen21DiTSmoothQuantConvRot,
+                  "Editing migration changed text-to-image optimizations")
+        var runtime = pe
+        runtime.qwen21DiTCache = "off"; runtime.promptEnhance = false
+        runtime.acceleration = StudioAcceleration(policy: "gpu_ane", runtimeAneProfileID: RuntimeImageWorker.profileID)
+        try check(runtime.normalizeQwen21EditingConfiguration() == nil && runtime.usesRuntimeANE,
+                  "Editing migration disabled the separately supported Runtime route")
+        var other = generation; other.modelID = "flux2-klein-4b"; other.operation = "image.edit"
+        try check(other.normalizeQwen21EditingConfiguration() == nil && other.usesANE,
+                  "Qwen editing migration changed another model")
+        var fastReference = incompatible
+        fastReference.assets = Array(assets.prefix(1)); fastReference.qwen21ReferenceSize = 512
+        _ = fastReference.normalizeQwen21EditingConfiguration(systemJSON: "{}")
+        let fastRequest = try fastReference.request(output: output, systemJSON: "{}")
+        try check(fastRequest.qwen21_reference_size == 512 && fastRequest.qwen21_dit_cache == "fast",
+                  "Editing migration discarded explicit fast reference encoding or cache")
+        _ = try NativeEngine.plan(fastRequest)
+        var hybrid = generation
+        hybrid.operation = "image.edit"; hybrid.qwen21ReferenceSize = 512
+        hybrid.qwen21DiTSmoothQuantConvRot = false
+        for count in 1...3 {
+            for cache in Qwen21DiTCacheMode.allCases {
+                var configured = hybrid
+                configured.assets = Array(assets.prefix(count)); configured.qwen21DiTCache = cache.rawValue
+                try check(configured.normalizeQwen21EditingConfiguration(systemJSON: eligibleHardware) == nil &&
+                          configured.qualifiedQwen21StagedANEEdit(systemJSON: eligibleHardware),
+                          "Qualified resized-reference ANE edit was silently downgraded")
+                let request = try configured.request(output: output, systemJSON: eligibleHardware)
+                try check(request.execution == "gpu_ane" && request.qwen21_w8a8 == true &&
+                          request.qwen21_dit_w8a8 == true && request.qwen21_dit_smoothquant_convrot == nil &&
+                          request.hybrid_mlp_mode == "base_fused" && request.qwen21_reference_size == 512 &&
+                          request.qwen21_dit_cache == cache.rawValue && request.inputs?.count == count &&
+                          request.allow_approximation == true,
+                          "Qualified ANE edit lost W8A8, reference order or cache intent")
+                if Qwen21LowMemoryANEHardware.isEligible(systemJSON: NativeEngine.system()) {
+                    _ = try NativeEngine.plan(request)
+                }
+            }
+        }
+        var calibratedOnly = hybrid
+        calibratedOnly.qwen21DiTSmoothQuantConvRot = true
+        let calibrationNotice = calibratedOnly.normalizeQwen21EditingConfiguration(systemJSON: eligibleHardware)
+        try check(calibrationNotice == nil && calibratedOnly.qwen21DiTSmoothQuantConvRot &&
+                  calibratedOnly.qwen21DiTW8A8,
+                  "Editing migration discarded the independent editing calibration")
+        for gpu4 in [false, true] {
+            calibratedOnly.acceleration?.qwen21W8A8 = gpu4
+            let combined = try calibratedOnly.request(output: output, systemJSON: eligibleHardware)
+            try check(combined.qwen21_dit_smoothquant_convrot == true && combined.qwen21_dit_w8a8 == true &&
+                      combined.qwen21_w8a8 == true && combined.qwen21_staged_fast == nil,
+                      "Editing SQ/ANE still depended on the generation GPU 4-bit toggle")
+            let restored = try JSONDecoder().decode(StudioDraft.self, from: JSONEncoder().encode(calibratedOnly))
+            try check(restored.qwen21DiTSmoothQuantConvRot, "Editing calibration lost during draft persistence")
+            let v2 = NativeRequestV2(legacy: combined)
+            try check(v2.execution.qwen21_dit_smoothquant_convrot == true, "Editing calibration lost in schema v2")
+        }
+        calibratedOnly.qwen21DiTW8A8 = false
+        try check(calibratedOnly.qwen21DiTSmoothQuantConvRotIssue(systemJSON: eligibleHardware) != nil,
+                  "Editing SQ did not require DiT W8A8")
+        _ = calibratedOnly.normalizeQwen21EditingConfiguration(systemJSON: eligibleHardware)
+        try check(!calibratedOnly.qwen21DiTSmoothQuantConvRot && calibratedOnly.usesANE,
+                  "Unsupported SQ normalization disabled compatible ANE")
+        for change: (inout StudioDraft) -> Void in [
+            { $0.qwen21ReferenceSize = 1024 }, { $0.assets = Array(assets.prefix(4)) },
+            { $0.steps = 19 }, { $0.steps = 41 }, { $0.width = 768 },
+            { $0.residency = "resident" }, { $0.promptEnhance = true },
+            { $0.loras = [StudioLoRA(path: fixture.path)] },
+            { $0.profilePath = "/test/profile.json" }, { $0.acceleration?.compileGPU = true },
+            { $0.acceleration?.manifest = root.appendingPathComponent("fp16.json").path }, { $0.acceleration?.manifest = "" }
+        ] {
+            var invalid = hybrid; change(&invalid)
+            try check(!invalid.qualifiedQwen21StagedANEEdit(systemJSON: eligibleHardware),
+                      "Invalid ANE editing configuration passed shared eligibility")
+            var rejected = false
+            do { _ = try invalid.request(output: output, systemJSON: eligibleHardware) } catch { rejected = true }
+            try check(rejected, "Invalid ANE editing configuration reached submission")
+        }
+        try check(hybrid.qwen21ANEEditingConfigurationIssue(systemJSON: "{}") != nil,
+                  "Unknown hardware enabled low-memory ANE editing")
+        studio.draft = hybrid; studio.draft.acceleration?.policy = "gpu"
+        studio.draft.acceleration?.qwen21W8A8 = false
+        studio.setANEEnabled(true, systemJSON: eligibleHardware)
+        try check(studio.draft.qualifiedQwen21StagedANEEdit(systemJSON: eligibleHardware) &&
+                  studio.draft.qwen21DiTW8A8 && studio.message?.contains("固定 W8A8 ANE") == true,
+                  "ANE toggle could not enable a supported editing configuration")
+        studio.draft.qwen21ReferenceSize = 1024
+        try check(studio.draft.qwen21ANEEditingRequestIssue(systemJSON: eligibleHardware)?.contains("快速 512") == true,
+                  "Standard-reference ANE conflict did not explain explicit recovery")
     }
 
     @MainActor static func verifyTurboAndEditing(root: URL, fixture: URL, assets: [StudioAsset]) async throws {

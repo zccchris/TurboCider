@@ -50,7 +50,11 @@ struct AccelerationView: View {
             if studio.draft.modelID == "seedvr2-3b" { seedvr2VAEControls }
             Toggle("GPU", isOn: .constant(true)).toggleStyle(.checkbox).disabled(true)
             Toggle("额外启用 ANE", isOn: Binding(get: { studio.draft.usesANE }, set: { studio.setANEEnabled($0) }))
-                .toggleStyle(.checkbox).disabled(store.busy || !supportsGPUANE).accessibilityIdentifier("enableANE")
+                .toggleStyle(.checkbox)
+                .disabled(store.busy || !supportsGPUANE ||
+                          (studio.draft.modelID == "qwen-image-2.1" && studio.draft.operation == "image.edit" && !studio.draft.usesANE &&
+                           studio.draft.qwen21ANEEditingConfigurationIssue() != nil))
+                .accessibilityIdentifier("enableANE")
             Text(studio.draft.modelID == "seedvr2-3b"
                  ? "默认只使用 GPU。手动混合模式需选择通过校验的原始 FP16 已编译分区；不自动编译或替换分区。"
                  : "默认只使用 GPU；普通 ANE 使用匹配的冻结分区，本机 Runtime 实验使用独立进程。")
@@ -117,15 +121,15 @@ struct AccelerationView: View {
             if config.policy == "gpu_ane" && !studio.draft.usesRuntimeANE {
                 if studio.draft.modelID == "qwen-image-2.1" {
                     Toggle("GPU 4 位权重缓存（加速）", isOn: Binding(
-                        get: { config.qwen21W8A8 ?? false },
+                        get: { studio.draft.operation == "image.edit" ? false : config.qwen21W8A8 ?? false },
                         set: { value in
                             guard !value || qwenLowMemoryANEAvailable else { return }
                             update { $0.qwen21W8A8 = value }
                             if value { studio.draft.residency = "component_staged" }
                         }))
-                        .disabled(store.busy || (!qwenLowMemoryANEAvailable && config.qwen21W8A8 != true))
+                        .disabled(store.busy || studio.draft.operation == "image.edit" || (!qwenLowMemoryANEAvailable && config.qwen21W8A8 != true))
                         .accessibilityIdentifier("qwenLowMemoryANE")
-                    Text("仅控制 GPU 注意力与 FFN 补充分支的 4 位权重缓存。关闭后保留原精度 GPU 权重和逐层加载，可单独测 ANE；DiT W8A8 开启时使用其独立 8 位缓存。ANE 精度由所选 manifest 决定，关闭此项不会把 W8A8 分区变为 FP16。")
+                    Text("此项仅用于文生图，编辑保留原精度 GPU 权重或显式 DiT W8A8。仅控制 GPU 注意力与 FFN 补充分支的 4 位权重缓存。关闭后保留原精度 GPU 权重和逐层加载，可单独测 ANE；DiT W8A8 开启时使用其独立 8 位缓存。ANE 精度由所选 manifest 决定，关闭此项不会把 W8A8 分区变为 FP16。")
                         .font(.caption).foregroundStyle(.secondary)
                 } else if studio.draft.modelID == "seedvr2-3b" {
                     Text("GPU 处理 attention、文本 FFN、VAE 与视频 FFN 的剩余通道；Core ML CPU+NE 处理原始 FP16 前缀，不量化权重。固定行数分批保留完整视频，实际 ANE 驻留由系统决定。")
@@ -156,7 +160,7 @@ struct AccelerationView: View {
                 Toggle("SmoothQuant＋ConvRot（DiT 保真选项）", isOn: $studio.draft.qwen21DiTSmoothQuantConvRot)
                     .disabled(store.busy || (studio.draft.qwen21DiTSmoothQuantConvRotIssue() != nil && !studio.draft.qwen21DiTSmoothQuantConvRot))
                     .accessibilityIdentifier("qwenDiTSmoothQuantConvRot")
-                Text("默认关闭，继续使用当前 W8A8。开启后使用独立约 11 GiB 缓存；三个样本更接近浮点参考，但可能更慢。对比时只切换此项，保持 W8A8、ANE、种子、步数和 DiT 缓存档位一致。文本编码器与 VAE 不变。")
+                Text("默认关闭。文生图和快速 512 编辑使用各自的内置校准；首次使用每种配方需准备独立约 11 GiB 缓存。这是保真选项，图像细节会变化，也可能更慢。对比时只切换此项，保持 W8A8、ANE、种子、步数和 DiT 缓存档位一致。文本编码器与 VAE 不变。")
                     .font(.caption).foregroundStyle(.secondary)
                 if let reason = studio.draft.qwen21DiTSmoothQuantConvRotIssue() {
                     Text(reason).font(.caption).foregroundStyle(.secondary)
